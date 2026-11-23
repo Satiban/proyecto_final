@@ -1,225 +1,215 @@
-# OralSolutions — Predicción de Abandono de Tratamientos Odontológicos
-
-Proyecto de ciencia de datos que prepara y modela los registros clínicos, operativos y financieros de la clínica odontológica **OralSolutions** con el objetivo de predecir la probabilidad de que un paciente activo abandone su tratamiento en los próximos 60 días tras cada consulta atendida. Con esta predicción, el equipo administrativo y clínico prioriza recordatorios personalizados y reprogramaciones preventivas antes de que se pierda la continuidad del tratamiento, reemplazando la gestión puramente reactiva actual.
-
-**Métrica de éxito:** Incrementar en **10 puntos porcentuales** la tasa de continuidad de tratamientos a 60 días frente al seguimiento reactivo habitual (línea base), activando alertas preventivas cuando la probabilidad predicha de abandono sea >= 1% (u = 0.01) (umbral justificado porque el costo operativo de un contacto preventivo es significativamente menor al costo clínico y financiero de perder un tratamiento recurrente).
-
-## Datos
-
-| Fuente | Qué contiene | Cómo se obtiene | Dónde queda |
-|---|---|---|---|
-| Dataset clínico-operativo OralSolutions (11 archivos CSV) | 38,603 registros distribuidos en: `patients.csv`, `dentists.csv`, `insurers.csv`, `procedures.csv`, `treatment_plans.csv`, `treatment_sessions.csv`, `treatment_lines.csv`, `appointments.csv`, `missed_appointments.csv`, `patient_followups.csv` e `invoices.csv` (citas, planes de tratamiento, sesiones, facturación, aseguradoras y seguimientos). | Descarga automática desde Google Drive mediante `src/ingestar.py` (o automáticamente al ejecutar Kestra en `ingest_raw_oralsolutions.yml`), sin requerir descargas manuales previas. | `data/raw/*.csv` |
-
-Los datos no están en el repositorio (ignorados por `.gitignore`). Para obtener y verificar los archivos desde cero (desde ``):
-
-- **Alternativa 1 — Descarga y verificación automática (recomendada):**
-  Ejecutar `src/ingestar.py`, el cual comprueba si los 11 CSV ya existen localmente y, de no estar presentes, los descarga automáticamente desde Google Drive y verifica sus **38,603 registros**:
-
+OralSolutions — Predicción de abandono de tratamientos odontológicos
+Proyecto de ciencia de datos para preparar, analizar y modelar información clínica, operativa y financiera de una clínica odontológica simulada, OralSolutions. Su objetivo es estimar el riesgo de que un paciente no continúe su tratamiento dentro de los 60 días posteriores a una cita atendida, para apoyar la priorización de contactos preventivos y reprogramaciones.
+Objetivo de negocio: incrementar en 10 puntos porcentuales la tasa de continuidad de tratamientos a 60 días respecto al seguimiento reactivo habitual. Esta es una meta del proyecto, no un resultado observado. Como política operativa propuesta, se contempla activar alertas cuando la probabilidad estimada de abandono sea al menos 1 % (`umbral = 0.01`); su eficacia y costo deben evaluarse con los resultados del modelo.
+> **Alcance de esta sección:** se documentan la fuente de datos, el entorno, el pipeline ELT del PSet2 y su integración en la estructura definitiva `proyecto_final/`. La preparación de etiquetas, el modelado predictivo y la puesta en producción corresponden a las fases posteriores.
+Datos
+El dataset sintético de OralSolutions comprende 11 archivos CSV y 38.603 registros de origen. Se creó para simular operaciones odontológicas y permitir el análisis de calidad, la transformación y el modelado sin emplear historias clínicas reales.
+Archivo	Registros	Contenido principal
+`appointments.csv`	7.788	Citas odontológicas
+`dentists.csv`	5	Odontólogos
+`insurers.csv`	4	Aseguradoras
+`invoices.csv`	7.788	Facturación
+`missed_appointments.csv`	1.500	Cancelaciones e inasistencias
+`patient_followups.csv`	1.243	Seguimiento y contacto con pacientes
+`patients.csv`	2.500	Pacientes
+`procedures.csv`	10	Catálogo de procedimientos
+`treatment_lines.csv`	7.956	Líneas de tratamiento/procedimientos
+`treatment_plans.csv`	3.015	Planes de tratamiento
+`treatment_sessions.csv`	6.794	Eventos e intentos de sesiones
+Total	38.603	11 fuentes
+Ubicación local: `data/raw/*.csv`. En la configuración actual, los archivos de datos están excluidos del repositorio mediante `.gitignore`.
+Obtención de los CSV
+Desde la raíz de `proyecto_final/`:
 ```powershell
-  # En local (con el entorno virtual activado)
-  python src/ingestar.py
-
-  # O mediante contenedor Docker aislado
-  docker build -t oralsolutions-ingesta .
-  docker run --rm -v "${PWD}\data\raw:/app/data/raw" oralsolutions-ingesta
+python src/ingestar.py
 ```
-- **Alternativa 2 — Descarga manual de respaldo:** Si la descarga automática falla por restricciones de red, descargar manualmente los 11 archivos CSV desde la [carpeta de Google Drive](https://drive.google.com/drive/folders/1bDd9OOZ1SPTLjnGQld5IIn-x4Gp8KQIh?usp=drive_link), pegarlos dentro de `data/raw/` y volver a ejecutar `python src/ingestar.py` para confirmar que todos los archivos y conteos estén íntegros.
-
-## Cómo correr el pipeline de datos
-
-Implementa un pipeline ELT reproducible que procesa los **11 archivos CSV** mediante **Kestra → Snowflake Raw → dbt (Bronze, Silver y Gold) → Apache Spark → Snowflake OBT**, además de incluir una cadena local de calidad y warehouse en **DuckDB** (`calidad/` y `warehouse/construir_warehouse.py`).
-
-### 1. Estructura del proyecto
-
+El script comprueba la presencia de los 11 archivos; si falta alguno, intenta descargarlos desde la carpeta compartida de Google Drive. Si están todos presentes, informa del número de archivos y del total de filas calculado a partir de los CSV. Este conteo no sustituye una auditoría de integridad del contenido.
+Como alternativa, descargar manualmente los archivos desde la carpeta de Google Drive de OralSolutions, colocarlos en `data/raw/` y volver a ejecutar el script.
+La ingesta también se invoca desde Kestra mediante el subflujo `kestra/ingest_raw_oralsolutions.yml`.
+Cómo correr el pipeline de datos
+La arquitectura ELT comprobada es:
 ```text
-
-├── Dockerfile                   # Imagen base de ingesta y validación
-├── Dockerfile.dbt               # Imagen de dbt Core con adaptador Snowflake
-├── requirements.txt             # Dependencias Python del proyecto
-├── .env.example                 # Plantilla de variables de entorno
+11 CSV → Kestra → Snowflake RAW → dbt Bronze → dbt Silver
+                                      → dbt Gold → Apache Spark → Snowflake OBT
+```
+Kestra: orquesta la ingesta, las transformaciones, las pruebas y la generación de la OBT.
+Snowflake RAW: almacena las 11 fuentes cargadas.
+dbt Core: construye Bronze (tipificación), Silver (depuración y normalización) y Gold (esquema dimensional), además de ejecutar pruebas.
+Apache Spark: lee Gold, verifica las claves y los joins, calcula variables históricas y escribe `OBT.OBT_RIESGO_ABANDONO`.
+Procesamiento batch: el flujo maestro incorpora un horario diario a las 02:00 (`America/Guayaquil`); la ejecución manual completa ya se verificó, mientras que la ejecución automática por horario todavía debe comprobarse de forma separada.
+1. Estructura del proyecto
+La estructura actual utiliza la raíz `proyecto_final/`, sin las carpetas antiguas `infra/`, `warehouse/`, `procesamiento/` o `modelado/` mencionadas en versiones previas del README.
+```text
+proyecto_final/
+├── README.md
+├── docker-compose.yml             # Servicios Docker del proyecto
+├── Dockerfile.dbt                 # Imagen de dbt con adaptador Snowflake
+├── requirements.txt              # Dependencias Python locales
+├── .env.example                  # Plantilla pública de variables
+├── .env                          # Credenciales locales: NO versionar
+├── .gitignore
+├── config/
+│   └── dbt/
+│       ├── profiles.example.yml
+│       └── profiles.yml          # Perfil privado de Snowflake: NO versionar
 ├── data/
-│   ├── raw/                     # 11 CSV de origen (ignorados por Git)
-│   └── processed/               # Dataset limpio de modelado (obt_riesgo_abandono.csv)
-├── ingesta/
-│   └── ingestar.py              # Descarga desde Drive y verificación de los 11 CSV
-├── calidad/
-│   ├── diagnostico_proyecto.ipynb # Análisis de calidad por tabla y dimensión
-│   └── limpiar.py               # Ejecutor de la limpieza centralizada en dbt Silver
-├── warehouse/
-│   ├── construir_warehouse.py   # Carga y verificación de filas en DuckDB
-│   └── dbt/                     # Modelos y pruebas Bronze, Silver y Gold
-├── procesamiento/
-│   └── job_spark.py             # Construcción y validación de la OBT con Spark
+│   └── raw/                      # 11 CSV, excluidos de Git
+├── dbt/
+│   ├── dbt_project.yml
+│   ├── models/
+│   │   ├── bronze/               # 11 modelos y _sources.yml
+│   │   ├── silver/               # 11 modelos y _silver.yml
+│   │   └── gold/                 # 6 modelos y schema.yml
+│   ├── macros/
+│   │   └── generate_schema_name.sql
+│   └── tests/                    # Pruebas SQL, si corresponden
 ├── kestra/
+│   ├── ingesta.yml               # Flujo maestro; id interno: flow_proyecto
 │   ├── ingest_raw_oralsolutions.yml
+│   ├── backfill_oralsolutions.yml
 │   ├── test_dbt_docker.yml
 │   ├── test_spark_docker.yml
-│   ├── backfill_oralsolutions.yml  # Backfill parametrizado para las 11 fuentes
-│   ├── flow_proyecto.yml           # Flujo maestro ELT (id: flow_proyecto)
-│   ├── produccion_lotes.yml        # Inferencia batch nocturna contra la API
-│   ├── monitoreo.yml               # Evaluación de deriva y alertas
-│   └── reentrenamiento.yml         # Reentrenamiento con pausa de aprobación humana
-├── infra/
-│   ├── docker-compose.yml          # PostgreSQL, Kestra, Spark, dbt, MLflow, API y Tablero
-│   ├── config/dbt/                 # Plantilla y perfil privado de dbt
-│   └── sql/                        # Inicialización de Snowflake
-├── modelado/
-│   ├── preparar_obt.py             # Extrae OBT de Snowflake, calcula abandono_60d y guarda CSV limpio
-│   ├── explorar_proyecto.ipynb     # EDA y 3 hallazgos que guían el modelado
-│   ├── features_proyecto.ipynb     # Diseño y prueba sin fuga de 4 features derivadas
-│   ├── pipeline_proyecto.py        # División temporal, features y preprocesador reutilizable
-│   ├── modelos_proyecto.ipynb      # Líneas base, candidatos y resultados_proyecto.csv
-│   ├── comparar_proyecto.ipynb     # Ensamblajes vs. red neuronal y prueba de LLM
-│   ├── experimentos_proyecto.ipynb # Tuning, tracking MLflow y corridas_proyecto.csv
-│   ├── validacion_proyecto.ipynb   # Validación cruzada, costos y calibración de umbral
-│   ├── resultados_proyecto.csv     # Tabla comparativa de modelos candidatos
-│   ├── corridas_proyecto.csv       # Exportación limpia de las 101 corridas de MLflow
-│   ├── test_pipeline_proyecto.py   # Pruebas unitarias reproducibles del pipeline
-│   └── reentrenar.py               # Reentrenamiento controlado y exportación MLflow
-├── servicio/
-│   ├── Dockerfile                  # Imagen de producción de la API FastAPI
-│   ├── requirements.txt            # Dependencias fijadas del servicio
-│   ├── api.py                      # Endpoints /salud, /modelo, /predecir, /metricas, /alertas
-│   ├── esquemas.py                 # Contratos Pydantic de entrada/salida
-│   ├── test_api.py                 # Pruebas de contrato, modelo, negocio y respaldo
-│   └── fixtures/                   # Modelo @champion y muestra fija para CI
-├── monitoreo/
-│   ├── deriva.py                   # Calidad de datos, PSI, KS, Chi² y deriva conceptual
-│   ├── alertas.py                  # Reglas de alerta calibradas por simulación
-│   ├── simular_produccion.py       # Simulación L01-L08 + L09 datos + L10 conceptual
-│   └── tablero.py                  # Tablero interactivo en Streamlit
-└── docs/                           # Memos, decision_modelo.md, despliegue.md y CSV de evidencias
+│   ├── produccion_lotes.yml
+│   ├── monitoreo.yml
+│   └── reentrenamiento.yml
+├── spark/
+│   ├── job_spark.py
+│   └── verificar_conexion.py
+├── src/
+│   ├── ingestar.py
+│   ├── datos.py
+│   ├── pipeline.py
+│   └── reentrenar.py
+└── docs/                        # Documentación y evidencias
 ```
-
-> **Nota de estructura:** El proyecto sigue la estructura oficial del repositorio del curso (``). Su equivalencia con la plantilla del enunciado PDF es: `docker-compose.yml` (`docker-compose.yml`), `kestra/` (`kestra/`), `dbt/` (`dbt/`), `procesamiento/` (`spark/`), `modelado/` (`src/` y `notebooks/`), `servicio/` (`api/` y `tests/`), `monitoreo/` (`monitoreo/`) y `docs/` (`docs/`).
-
-### 2. Requisitos previos y entorno Python
-- **Docker Desktop** con Docker Compose y contenedores Linux. Los comandos siguientes están escritos para **PowerShell en Windows**.
-- **Python 3.11+** con un entorno virtual dedicado donde se instalen las librerías de requirements.txt (numpy, pandas, python-dotenv, requests, gdown, duckdb, pytest):
-
-```PowerShell
-# Crear y activar entorno virtual en PowerShell (desde )
+> El árbol muestra los archivos y directorios relevantes para reproducir el **pipeline de datos**. La aplicación del PSet4 puede incluir, además, otros módulos, servicios, notebooks, pruebas y artefactos que deben documentarse en las secciones correspondientes. El archivo **`kestra/ingesta.yml` no se renombra**: su identificador dentro de Kestra es `oralsolutions.flow_proyecto`.
+2. Requisitos previos y entorno Python
+Docker Desktop con Docker Compose y contenedores Linux.
+Python 3.11 o compatible con las dependencias de `requirements.txt`.
+Cuenta de Snowflake con permisos suficientes para crear o utilizar el warehouse, la base de datos, los esquemas, las tablas y el stage. El entorno comprobado utiliza el rol `ACCOUNTADMIN`; para un despliegue real se recomienda un rol de privilegios mínimos.
+Internet para Google Drive, Snowflake, imágenes Docker y paquetes Maven utilizados por Spark.
+Los siguientes comandos están pensados para PowerShell en Windows, ejecutados desde `proyecto_final/`:
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
-
-En Linux / GitHub Codespaces:
-
+En Linux:
 ```bash
-python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
-
-- **Cuenta de Snowflake** con permisos `ACCOUNTADMIN` y un método de autenticación compatible con conexiones **usuario/contraseña**.
-- Conexión a Internet para descargar los datos desde Google Drive, conectar con Snowflake y descargar las imágenes/dependencias de Docker y Spark.
-- Sin descargas manuales: los 11 archivos CSV se descargan y verifican automáticamente en data/raw/ al ejecutar python src/ingestar.py o directamente desde el flujo de Kestra (oralsolutions.flow_proyecto).
-
-> Salvo los scripts SQL (que se ejecutan en **Snowsight**), todos los comandos se ejecutan desde **``**.
-
-#### Configuración requerida en Snowflake
-La implementación actual utiliza estos nombres en los scripts SQL y en los flujos YAML; **cambiar las variables `SNOWFLAKE_*` de `.env` no cambia automáticamente los valores escritos en los flujos de Kestra**.
-
-|**Recurso**|**Nombre o requisito utilizado**|
-|---|---|
-|Base de datos|`ORALSOLUTIONS_DW`|
-|Warehouse|`COMPUTE_WH`|
-|Rol de los flujos JDBC de Kestra|`ACCOUNTADMIN`|
-|Esquemas|`RAW`, `BRONZE`, `SILVER`, `GOLD`, `OBT`|
-|Autenticación actual|Usuario y contraseña admitidos por la cuenta|
-
-En una cuenta nueva, utilizar estos nombres y los permisos correspondientes. Si se desea utilizar otro rol, warehouse o nombre de base de datos, habrá que modificar **de manera coherente los YAML, scripts SQL, perfil dbt y configuración de Spark**. La inicialización SQL crea el warehouse, la base, los esquemas, las tablas Raw, el formato CSV y el stage, pero **no aprovisiona el usuario**.
-
-### 3. Obtener los datos y configurar credenciales privadas
-
-1. **Descargar y verificar los 11 archivos CSV en `data/raw/`:**
-
-```PowerShell
-python src/ingestar.py
-```
-
-_(Confirma que los 11 archivos y sus **38,603 registros** estén disponibles en `data/raw/`)._
-
-2. **Crear los archivos locales de configuración a partir de las plantillas públicas (ignorados por `.gitignore`):**
-
-```PowerShell
+3. Preparar Snowflake y configurar credenciales
+Recursos utilizados en la implementación verificada:
+Recurso	Valor
+Base de datos	`ORALSOLUTIONS_DW`
+Warehouse	`COMPUTE_WH`
+Esquemas	`RAW`, `BRONZE`, `SILVER`, `GOLD`, `OBT`
+Rol usado en las pruebas	`ACCOUNTADMIN`
+Stage CSV	`RAW.RAW_CSV_STAGE`
+Formato CSV	`RAW.CSV_RAW_FORMAT`
+Inicialización en Snowflake: antes de lanzar una carga en una cuenta vacía, se deben ejecutar los scripts SQL de preparación del entorno (creación de base de datos y esquemas, 11 tablas RAW, formato de CSV y stage). Verificar la ubicación exacta de esos scripts en la copia definitiva del proyecto; las rutas antiguas `infra/sql/` o `sql/` no deben suponerse válidas sin comprobarlas. La inicialización no crea necesariamente un usuario Snowflake.
+Crear los archivos privados a partir de sus plantillas:
+```powershell
 Copy-Item .env.example .env
 Copy-Item config/dbt/profiles.example.yml config/dbt/profiles.yml
 ```
-
-En Linux / GitHub Codespaces:
-
-```bash
-cp .env.example .env
-cp config/dbt/profiles.example.yml config/dbt/profiles.yml
-```
-
-- **En `.env`:** completar `KESTRA_DB_PASSWORD`, `KESTRA_ADMIN_EMAIL`, `KESTRA_ADMIN_PASSWORD`, `ENV_SNOWFLAKE_URL`, `ENV_SNOWFLAKE_USER`, `SF_ACCOUNT`, `SF_USER`, `SF_WAREHOUSE=COMPUTE_WH`, `SF_DATABASE=ORALSOLUTIONS_DW`, `SF_GOLD_SCHEMA=GOLD`, `SF_OBT_SCHEMA=OBT`, `SF_ROLE=ACCOUNTADMIN`, `SECRET_SNOWFLAKE_PASSWORD` (contraseña en Base64 UTF-8) y `ENV_KESTRA_HOST_PROJECT_PATH` (ruta absoluta de `` visible para Docker, guardando `.env` en UTF-8 sin BOM con finales de línea `LF`).
-
-```PowerShell
-# Generar SECRET_SNOWFLAKE_PASSWORD en Base64:
+Configurar los valores requeridos por Docker, Kestra y Spark. Entre ellos:
+Kestra / Docker: `KESTRA_DB_PASSWORD`, `KESTRA_ADMIN_EMAIL`, `KESTRA_ADMIN_PASSWORD`, `ENV_SNOWFLAKE_URL`, `ENV_SNOWFLAKE_USER`, `SECRET_SNOWFLAKE_PASSWORD` y `ENV_KESTRA_HOST_PROJECT_PATH`.
+Spark: `SF_ACCOUNT`, `SF_USER`, `SF_DATABASE=ORALSOLUTIONS_DW`, `SF_WAREHOUSE=COMPUTE_WH`, `SF_ROLE=ACCOUNTADMIN`, `SF_GOLD_SCHEMA=GOLD`, `SF_OBT_SCHEMA=OBT` y `SECRET_SNOWFLAKE_PASSWORD`.
+dbt: en `config/dbt/profiles.yml`, mantener el perfil `oralsolutions` y configurar cuenta, usuario, contraseña, warehouse, rol, base de datos y target `dev` según la plantilla local.
+La variable `SECRET_SNOWFLAKE_PASSWORD` utilizada por el trabajo de Spark y los flujos correspondientes contiene la contraseña codificada en Base64 UTF-8. Base64 no es cifrado y no debe considerarse un mecanismo de protección. Para generar el valor:
+```powershell
 python -c "import base64,getpass; print(base64.b64encode(getpass.getpass('Contraseña Snowflake: ').encode('utf-8')).decode('ascii'))"
 ```
+Importante para Windows: guardar `.env` en UTF-8 con saltos de línea LF, porque el flujo actual de Spark lo carga desde Linux mediante `. /config/.env`. Este ajuste solucionó el error de lectura observado con CRLF. El archivo debe contener asignaciones compatibles con shell. No publicar `.env`, `profiles.yml`, contraseñas ni tokens.
+Ruta de montaje de Kestra: `ENV_KESTRA_HOST_PROJECT_PATH` debe señalar la ruta absoluta del proyecto visible para el motor Docker; en Docker Desktop para Windows puede ser diferente de `C:\...`. Esta ruta se usa para montar `src/`, `data/raw/`, `dbt/`, `config/dbt/`, `spark/` y `.env` en las tareas temporales de Kestra.
+4. Construir y levantar la infraestructura
+Desde `proyecto_final/`:
+```powershell
+# Validar la configuración de Docker Compose
+docker compose -p proyecto_final config --quiet
 
-- **En `config/dbt/profiles.yml`:** completar `account`, `user`, `password` (texto plano, sin Base64), `role: ACCOUNTADMIN` y `warehouse: COMPUTE_WH` manteniendo el perfil `oralsolutions`, target `dev` y base `ORALSOLUTIONS_DW`.
+# Construir las imágenes personalizadas (incluida dbt)
+docker compose -p proyecto_final build
 
-### 4. Cadena local de calidad y warehouse (DuckDB)
-1. **Limpieza y validación de calidad centralizada en dbt (capa Silver):**
-Las reglas documentadas en `calidad/diagnostico_proyecto.ipynb` viven exclusivamente en `dbt/models/silver/`. Una vez levantados los contenedores de la sección 5, pueden ejecutarse directamente con:
-```PowerShell
-  python calidad/limpiar.py
+# Iniciar los servicios necesarios para el pipeline de datos
+docker compose -p proyecto_final up -d postgres kestra dbt spark
+
+# Comprobar los contenedores
+docker compose -p proyecto_final ps -a
+
+# Verificar la conexión de dbt con Snowflake
+docker compose -p proyecto_final exec dbt dbt debug
 ```
-(Invoca dbt run --select silver y dbt test --select silver sin duplicar lógica de limpieza en Python).
-
-2. **Carga al warehouse local DuckDB y verificación de filas:**
-
-```PowerShell
-python warehouse/construir_warehouse.py
+La imagen utilizada por el subflujo dbt debe ser `proyecto_final-dbt:latest`, no la antigua `pset_2-dbt:latest`. El subflujo Spark utiliza `apache/spark:3.5.3`.
+5. Importar y ejecutar los flujos en Kestra
+Abrir http://localhost:8080. Registrar o actualizar los YAML del directorio `kestra/` en el namespace `oralsolutions`:
+`ingest_raw_oralsolutions.yml`: descarga/comprobación de archivos e ingesta idempotente a RAW, con procesamiento de 11 CSV.
+`test_dbt_docker.yml`: `dbt run` seguido de `dbt test`.
+`test_spark_docker.yml`: lectura de Gold, construcción y escritura de la OBT.
+`backfill_oralsolutions.yml`: recuperación histórica parametrizada.
+`ingesta.yml`: flujo maestro, con `id: flow_proyecto`.
+Luego abrir `oralsolutions.flow_proyecto` y pulsar Execute. El flujo maestro invoca los tres subflujos principales en este orden:
+```text
+ingesta_raw                 → oralsolutions.ingest_raw_oralsolutions
+transformar_y_validar_dbt   → oralsolutions.test_dbt_docker
+construir_obt_spark         → oralsolutions.test_spark_docker
 ```
-
-(Crea `warehouse/oralsolutions.duckdb` verificando que las **38,603 filas** cargadas coincidan exactamente con los CSV limpios).
-*(Nota: En entornos limpios como un Codespace nuevo, la primera ejecución del paso de Spark tarda ~9–10 minutos mientras descarga los conectores Maven/Ivy de Snowflake; en ejecuciones posteriores reutiliza el volumen caché `spark_ivy`).*
-
-### 5. Pipeline End-to-End en Docker + Snowflake (Kestra → dbt → Spark)
-1. **Inicializar Snowflake (en Snowsight):** ejecutar en orden:
-    - `sql/01_setup_snowflake.sql`: crea el warehouse `COMPUTE_WH`, la base `ORALSOLUTIONS_DW` y los esquemas `RAW`, `BRONZE`, `SILVER`, `GOLD` y `OBT`.
-    - `sql/02_create_raw_tables.sql`: crea las 11 tablas en `RAW`, el formato `CSV_RAW_FORMAT` y el stage `RAW_CSV_STAGE`.
-
-2. **Construir imagen de dbt y levantar infraestructura:**
-
-```PowerShell
-docker build -f Dockerfile.dbt -t pset_2-dbt:latest .
-docker compose --env-file .env --project-name pset_2 config --quiet
-docker compose --env-file .env --project-name pset_2 up -d postgres kestra spark dbt
-docker compose --env-file .env --project-name pset_2 exec dbt dbt debug
+El maestro utiliza `wait: true` y `transmitFailed: true`: espera a que termine cada subflujo y propaga sus fallos. La tarea de ingesta contiene reintentos exponenciales configurados con `maxAttempts: 3` para la descarga de fuentes.
+El maestro incluye un trigger diario:
+```yaml
+cron: "0 2 * * *"
+timezone: America/Guayaquil
 ```
+Se ha verificado la ejecución manual completa; la activación efectiva del trigger programado aún requiere una prueba independiente.
+6. Resultados verificados y operaciones opcionales
+En la ejecución del 23 de noviembre de 2026, el pipeline maestro `oralsolutions.flow_proyecto` terminó en Success, con sus 3 subflujos completados en 6 min 2,10 s. Los componentes se probaron además por separado.
+Componente	Resultado comprobado
+Fuentes RAW	11 tablas, 38.603 registros
+Verificación de identificadores RAW	`COUNT(*) = COUNT(DISTINCT ID)` en las 11 tablas tras repetir la ingesta
+dbt Bronze	11 tablas
+dbt Silver	11 tablas
+dbt Gold	5 dimensiones + 1 tabla de hechos
+Pruebas dbt	177 PASS, 0 WARN, 0 ERROR, 0 SKIP
+`GOLD.FACT_SESIONES_TRATAMIENTO`	6.794 eventos
+Spark — joins dimensionales	6.794 sesiones únicas conservadas
+`OBT.OBT_RIESGO_ABANDONO`	3.435 puntos candidatos
+Citas repetidas por paciente-plan-cita	0
+Candidatos sin `CITA_ID`	0
+Flujo maestro Kestra	Success, 3/3 etapas
+La OBT se genera antes de definir la variable objetivo `abandono_60d`. El corte temporal de observabilidad de 60 días y la preparación del dataset para entrenamiento forman parte de una etapa posterior; por ello, 3.435 filas de la OBT no deben confundirse con las 2.377 observaciones elegibles documentadas para modelado.
+El flujo de backfill también terminó en Success para las 11 fuentes en una ejecución parametrizada con fechas `2024-01-01` a `2025-12-31`. Esta prueba confirma que el proceso se completa sobre el histórico existente, pero no demuestra por sí sola la recuperación de filas ausentes. Esa prueba sigue pendiente en un entorno controlado.
+Comandos de operación
+```powershell
+# Ejecutar dbt manualmente dentro de su contenedor
+docker compose -p proyecto_final exec dbt dbt run
+docker compose -p proyecto_final exec dbt dbt test
 
-3. **Importar flujos en Kestra (`http://localhost:8080`):** crear y guardar los YAML de `kestra/` en el namespace `oralsolutions` en este orden:
-    
-    1. `kestra/ingest_raw_oralsolutions.yml`
-    2. `kestra/test_dbt_docker.yml`
-    3. `kestra/test_spark_docker.yml`
-    4. `kestra/backfill_oralsolutions.yml` *(recuperación histórica parametrizada para las 11 fuentes)*
-    5. `kestra/ingesta.yml` (**maestro**, `id: flow_proyecto`)
+# Ver estado de servicios
+docker compose -p proyecto_final ps -a
 
-4. **Ejecutar el pipeline maestro:** abrir `oralsolutions.flow_proyecto` en Kestra y seleccionar **Execute**. Ejecuta secuencialmente la **descarga automática desde Google Drive** (si faltan archivos en `data/raw/`), la ingesta idempotente a `RAW` (con reintentos exponenciales `maxAttempts: 3`), las transformaciones `dbt run` y `dbt test` (`BRONZE`, `SILVER`, `GOLD`), y la construcción de `OBT.OBT_RIESGO_ABANDONO` mediante `spark/job_spark.py`.
-
-### 6. Verificar resultados y operaciones opcionales
-Resultados esperados en Snowflake: **11** tablas cargadas en `RAW` (**38,603** registros), **28** modelos dbt, **177** pruebas aprobadas, **6,794** eventos en `GOLD.FACT_SESIONES_TRATAMIENTO` y **3,435** puntos candidatos únicos en `OBT.OBT_RIESGO_ABANDONO`.
-
-```PowerShell
-# Ejecución manual de dbt (desde )
-docker compose --env-file .env --project-name pset_2 exec dbt dbt run
-docker compose --env-file .env --project-name pset_2 exec dbt dbt test
-
-# Ejecución manual de Spark (desde )
-docker compose --env-file .env --project-name pset_2 exec spark /opt/spark/bin/spark-submit --master 'local[*]' --packages 'net.snowflake:spark-snowflake_2.12:3.2.3-spark_3.5,net.snowflake:snowflake-jdbc:4.0.2' /opt/spark/work-dir/job_spark.py
-
-# Detener servicios sin borrar volúmenes
-docker compose --env-file .env --project-name pset_2 down
+# Detener los contenedores sin eliminar volúmenes
+docker compose -p proyecto_final down
 ```
+Para reconstruir la OBT se recomienda ejecutar `oralsolutions.test_spark_docker` desde Kestra, ya que esta tarea configura expresamente las variables de entorno, los conectores Maven y el volumen con `spark/job_spark.py`. No se recomienda ejecutar un `spark-submit` aislado sin reproducir esa configuración.
+Validación rápida de la OBT en Snowsight
+```sql
+SELECT
+    COUNT(*) AS TOTAL_REGISTROS,
+    COUNT(DISTINCT SESION_KEY) AS SESIONES_UNICAS,
+    COUNT_IF(SESION_KEY IS NULL) AS CLAVES_NULAS
+FROM ORALSOLUTIONS_DW.OBT.OBT_RIESGO_ABANDONO;
+```
+Para el dataset utilizado, se esperan 3.435 registros, 3.435 sesiones únicas y 0 claves nulas.
+Decisión de procesamiento: Batch vs. Streaming
+Se seleccionó procesamiento por lotes (batch) diario, con horario propuesto de 02:00 en `America/Guayaquil`, porque el objetivo de negocio consiste en priorizar contactos, recordatorios y reprogramaciones ante el posible abandono durante un horizonte de 60 días. La decisión no requiere una respuesta de milisegundos ni una infraestructura de streaming continuo. Consolidar los registros durante la madrugada facilita que el personal disponga de información actualizada al comenzar la jornada, con una complejidad operativa menor.
 
-### Decisión de procesamiento: Batch vs. Streaming
-Este proyecto utiliza procesamiento por lotes (batch) diario (0 2 * * * , America/Guayaquil) y no requiere streaming, debido a que la decisión de negocio que habilita (priorizar llamadas, mensajes de seguimiento y reprogramaciones preventivas para pacientes con riesgo de abandonar su tratamiento en los próximos 60 días) no pierde valor con datos de horas de antigüedad. Durante la jornada diurna y vespertina la clínica registra citas y sesiones de forma progresiva, por lo que consolidar los datos en la madrugada permite que el equipo administrativo disponga cada mañana de las alertas actualizadas sin interferir con la operación clínica ni asumir la complejidad operativa de una arquitectura continua de baja latencia.
+
+
+
+
 
 ## Cómo entrenar y evaluar el modelo
 
