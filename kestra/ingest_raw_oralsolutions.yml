@@ -7,17 +7,20 @@ tasks:
   # 0. VERIFICAR O DESCARGAR LOS 11 CSV DESDE GOOGLE DRIVE
   - id: descargar_fuentes_drive
     type: io.kestra.plugin.scripts.shell.Commands
+
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
       image: python:3.11-slim
       volumes:
-        - "{{ envs.kestra_host_project_path }}/ingesta:/app/ingesta:ro"
+        - "{{ envs.kestra_host_project_path }}/src:/app/src:ro"
         - "{{ envs.kestra_host_project_path }}/data/raw:/app/data/raw"
+
     commands:
       - |
         set -e
         pip install -q --no-cache-dir gdown==5.2.0
         python /app/src/ingestar.py
+
     retry:
       type: exponential
       interval: PT5S
