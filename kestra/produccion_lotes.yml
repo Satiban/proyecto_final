@@ -1,0 +1,34 @@
+id: produccion_lotes
+namespace: oralsolutions.mlops
+description: "Inferencia batch nocturna contra la API @champion (02:00 America/Guayaquil)."
+
+triggers:
+  - id: horario_nocturno_batch
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 2 * * *"
+    timezone: America/Guayaquil
+
+tasks:
+  - id: verificar_salud_api
+    type: io.kestra.plugin.core.http.Request
+    uri: "http://api:8000/salud"
+    method: GET
+
+  - id: ejecutar_inferencia_lotes
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: pset_2_default
+    containerImage: python:3.14-slim
+    env:
+      API_URL: "http://api:8000"
+    beforeCommands:
+      - pip install -q pandas numpy requests scikit-learn scipy
+    commands:
+      - python monitoreo/simular_produccion.py
+
+  - id: disparar_monitoreo
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: oralsolutions.mlops
+    flowId: monitoreo
+    wait: true

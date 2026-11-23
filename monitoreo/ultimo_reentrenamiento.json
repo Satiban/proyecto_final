@@ -1,0 +1,31 @@
+{
+  "motivo_disparo": "Alerta critica de deriva conceptual en L10_deriva_conceptual (PR-AUC < 0.960)",
+  "ventana_entrenamiento": "historico (1551) + L01-L08 (826) = 2377 filas",
+  "lote_evaluacion": "L10_deriva_conceptual",
+  "champion_actual": {
+    "version": "7",
+    "run_id": "169e8821e2c54761bf602b21f86aec93",
+    "pr_auc": 0.61267,
+    "recall": 0.875,
+    "precision": 0.4615,
+    "costo_errores_usd": 867.0,
+    "balance_neto_usd": 771.0,
+    "FP": 49,
+    "FN": 6
+  },
+  "challenger_nuevo": {
+    "version": "9",
+    "run_id": "ee684c683fc04b54845826bc76ce3b32",
+    "pr_auc": 0.58472,
+    "recall": 0.9375,
+    "precision": 0.4592,
+    "costo_errores_usd": 519.0,
+    "balance_neto_usd": 1236.0,
+    "FP": 53,
+    "FN": 3
+  },
+  "cumple_regla_promocion": false,
+  "decision_humana": "rechazar",
+  "motivo_decision": "Rechazado tras revision humana: la deriva conceptual de L10 requiere datos etiquetados bajo el nuevo comportamiento antes de promover",
+  "promovido_a_champion": false
+}

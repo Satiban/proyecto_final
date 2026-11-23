@@ -1,0 +1,67 @@
+id: reentrenamiento
+namespace: oralsolutions.mlops
+description: "Reentrenamiento controlado con pausa de aprobación humana antes de promover @challenger a @champion."
+
+inputs:
+  - id: lote_eval
+    type: STRING
+    defaults: "L10_deriva_conceptual"
+  - id: motivo_disparo
+    type: STRING
+    defaults: "Alerta crítica de deriva conceptual (PR-AUC < 0.960)"
+
+tasks:
+  - id: entrenar_challenger
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: pset_2_default
+    containerImage: python:3.14-slim
+    env:
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      MODEL_NAME: "oralsolutions-modelo"
+    beforeCommands:
+      - pip install -q mlflow-skinny scikit-learn pandas numpy scipy
+    commands:
+      - >
+        python src/reentrenar.py
+        --lote-eval "{{ inputs.lote_eval }}"
+        --motivo "{{ inputs.motivo_disparo }}"
+        --decision pendiente
+
+  - id: pausa_aprobacion_humana
+    type: io.kestra.plugin.core.flow.Pause
+    description: "Revisión manual de métricas @champion vs @challenger antes de promover."
+    onResume:
+      - id: decision_humana
+        type: SELECT
+        values:
+          - aprobar
+          - rechazar
+        defaults: rechazar
+      - id: motivo_decision
+        type: STRING
+        defaults: "Rechazado tras revisión humana: no cumple regla de promoción."
+
+  - id: aplicar_decision_promocion
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: pset_2_default
+    containerImage: python:3.14-slim
+    env:
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+    beforeCommands:
+      - pip install -q mlflow-skinny
+    script: |
+      from mlflow.tracking import MlflowClient
+      decision = "{{ outputs.pausa_aprobacion_humana.onResume.decision_humana }}"
+      motivo = "{{ outputs.pausa_aprobacion_humana.onResume.motivo_decision }}"
+      client = MlflowClient("http://mlflow:5000")
+      if decision == "aprobar":
+          mv = client.get_model_version_by_alias("oralsolutions-modelo", "challenger")
+          client.set_registered_model_alias("oralsolutions-modelo", "champion", mv.version)
+          print(f"[PROMOVIDO] @champion -> v{mv.version}. Motivo: {motivo}")
+      else:
+          mv = client.get_model_version_by_alias("oralsolutions-modelo", "champion")
+          print(f"[INTACTO] @champion permanece en v{mv.version}. Motivo: {motivo}")

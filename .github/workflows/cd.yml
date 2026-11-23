@@ -1,0 +1,60 @@
+name: CD - Publicar imagen API en GHCR
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  validar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: api/requirements.txt
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r api/requirements.txt
+          pip install pytest==8.4.2 httpx==0.28.1
+
+      - name: Correr pruebas antes de publicar
+        env:
+          USAR_MODELO_LOCAL: "true"
+          REGISTRAR_SNOWFLAKE: "false"
+        run: pytest tests -v
+
+  publicar-imagen:
+    needs: validar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Iniciar sesión en GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construir y publicar imagen etiquetada con hash del commit
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGEN="ghcr.io/${OWNER}/oralsolutions-api"
+          docker build -f api/Dockerfile \
+            -t "${IMAGEN}:${{ github.sha }}" \
+            -t "${IMAGEN}:latest" \
+            .
+          docker push "${IMAGEN}:${{ github.sha }}"
+          docker push "${IMAGEN}:latest"

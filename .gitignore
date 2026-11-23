@@ -1,0 +1,48 @@
+# Variables de entorno y credenciales privadas
+.env
+.env.*
+!.env.example
+config/dbt/profiles.yml
+**/profiles.yml
+
+# Datos locales (crudos, procesados, DuckDB y MLflow local)
+data/raw/*.csv
+data/processed/*.csv
+data/processed/*.parquet
+*.duckdb
+*.duckdb.wal
+mlruns/
+mlartifacts/
+*.db
+*.sqlite
+*.pkl
+*.joblib
+
+# Python y Jupyter
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# dbt (artefactos autogenerados)
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+
+# Archivos del sistema y logs
+.DS_Store
+Thumbs.db
+logs/
+*.log
+
+# Logs locales del servicio API
+api/predicciones_log.csv
+
+# Permitir únicamente el modelo fixture exportado para pruebas de CI
+!tests/fixtures/modelo_champion/
+!tests/fixtures/modelo_champion/**
+
+# dataset de simulacion de lotes de producción (no se sube)
+monitoreo/lotes_simulados.csv

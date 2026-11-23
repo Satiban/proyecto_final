@@ -1,0 +1,224 @@
+id: backfill_oralsolutions
+namespace: oralsolutions
+
+description: >
+  Recuperacion historica parametrizada e idempotente para las 11 fuentes
+  de OralSolutions hacia RAW desde RAW_CSV_STAGE.
+
+inputs:
+  - id: fuente
+    type: SELECT
+    defaults: ALL
+    values:
+      - ALL
+      - patients
+      - dentists
+      - insurers
+      - procedures
+      - appointments
+      - missed_appointments
+      - invoices
+      - treatment_plans
+      - treatment_sessions
+      - treatment_lines
+      - patient_followups
+    description: Selecciona ALL para ejecutar sobre las 11 fuentes o elige una tabla especifica.
+
+  - id: fecha_inicio
+    type: DATE
+    required: true
+    defaults: "2024-01-01"
+
+  - id: fecha_fin
+    type: DATE
+    required: true
+    defaults: "2025-12-31"
+
+tasks:
+  # 1. VALIDAR RANGO DE FECHAS
+  - id: validar_fechas
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.fecha_inicio > inputs.fecha_fin }}"
+    then:
+      - id: rango_invalido
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "La fecha de inicio no puede ser mayor a la fecha de fin."
+    else:
+      - id: rango_valido
+        type: io.kestra.plugin.core.log.Log
+        message: >
+          Rango de fechas valido ({{ inputs.fecha_inicio }} a {{ inputs.fecha_fin }}).
+          Fuente seleccionada: {{ inputs.fuente }}.
+
+  # 2. RECORRER TODAS LAS FUENTES (O LA FUENTE SELECCIONADA)
+  - id: procesar_backfill
+    type: io.kestra.plugin.core.flow.Loop
+    concurrencyLimit: 1
+    values: "{{ inputs.fuente == 'ALL' ? ['patients', 'dentists', 'insurers', 'procedures', 'appointments', 'missed_appointments', 'invoices', 'treatment_plans', 'treatment_sessions', 'treatment_lines', 'patient_followups'] : [inputs.fuente] }}"
+
+    tasks:
+      # 2.1 PREPARAR TABLA TEMPORAL DE RECEPCION
+      - id: preparar_backfill
+        type: io.kestra.plugin.jdbc.snowflake.Query
+        url: "{{ envs.snowflake_url }}"
+        username: "{{ envs.snowflake_user }}"
+        password: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+        role: ACCOUNTADMIN
+        warehouse: COMPUTE_WH
+        database: ORALSOLUTIONS_DW
+        schema: RAW
+        sql: |
+          CREATE OR REPLACE TABLE
+            ORALSOLUTIONS_DW.RAW.{{ item.value | upper }}_BACKFILL_INCOMING
+          LIKE
+            ORALSOLUTIONS_DW.RAW.{{ item.value | upper }};
+        retry:
+          type: exponential
+          interval: PT5S
+          maxInterval: PT30S
+          maxAttempts: 3
+
+      # 2.2 CARGAR CSV HISTORICO DESDE STAGE
+      - id: cargar_historico
+        type: io.kestra.plugin.jdbc.snowflake.Query
+        url: "{{ envs.snowflake_url }}"
+        username: "{{ envs.snowflake_user }}"
+        password: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+        role: ACCOUNTADMIN
+        warehouse: COMPUTE_WH
+        database: ORALSOLUTIONS_DW
+        schema: RAW
+        sql: |
+          COPY INTO
+            ORALSOLUTIONS_DW.RAW.{{ item.value | upper }}_BACKFILL_INCOMING
+          FROM
+            @ORALSOLUTIONS_DW.RAW.RAW_CSV_STAGE/{{ item.value }}/
+          FILES = ('{{ item.value }}.csv')
+          FILE_FORMAT = (
+            FORMAT_NAME = 'ORALSOLUTIONS_DW.RAW.CSV_RAW_FORMAT'
+          )
+          ON_ERROR = ABORT_STATEMENT
+          FORCE = FALSE;
+        retry:
+          type: exponential
+          interval: PT5S
+          maxInterval: PT30S
+          maxAttempts: 3
+
+      # 2.3 INSERTAR REGISTROS FALTANTES CON FILTRO TEMPORAL E IDEMPOTENCIA
+      - id: insertar_historicos
+        type: io.kestra.plugin.jdbc.snowflake.Query
+        url: "{{ envs.snowflake_url }}"
+        username: "{{ envs.snowflake_user }}"
+        password: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+        role: ACCOUNTADMIN
+        warehouse: COMPUTE_WH
+        database: ORALSOLUTIONS_DW
+        schema: RAW
+        sql: |
+          INSERT INTO ORALSOLUTIONS_DW.RAW.{{ item.value | upper }}
+          SELECT historico.*
+          FROM ORALSOLUTIONS_DW.RAW.{{ item.value | upper }}_BACKFILL_INCOMING AS historico
+          WHERE
+          {% if item.value == 'appointments' or item.value == 'missed_appointments' %}
+            COALESCE(TRY_TO_DATE(historico.SCHEDULED_AT), TRY_TO_TIMESTAMP_NTZ(historico.SCHEDULED_AT)::DATE)
+              BETWEEN TO_DATE('{{ inputs.fecha_inicio }}') AND TO_DATE('{{ inputs.fecha_fin }}')
+            AND
+          {% elseif item.value == 'invoices' %}
+            COALESCE(TRY_TO_DATE(historico.ISSUED_ON), TRY_TO_TIMESTAMP_NTZ(historico.ISSUED_ON)::DATE)
+              BETWEEN TO_DATE('{{ inputs.fecha_inicio }}') AND TO_DATE('{{ inputs.fecha_fin }}')
+            AND
+          {% elseif item.value == 'treatment_plans' %}
+            COALESCE(TRY_TO_DATE(historico.START_DATE), TRY_TO_TIMESTAMP_NTZ(historico.START_DATE)::DATE)
+              BETWEEN TO_DATE('{{ inputs.fecha_inicio }}') AND TO_DATE('{{ inputs.fecha_fin }}')
+            AND
+          {% elseif item.value == 'treatment_sessions' %}
+            COALESCE(TRY_TO_DATE(historico.PLANNED_DATE), TRY_TO_TIMESTAMP_NTZ(historico.PLANNED_DATE)::DATE)
+              BETWEEN TO_DATE('{{ inputs.fecha_inicio }}') AND TO_DATE('{{ inputs.fecha_fin }}')
+            AND
+          {% elseif item.value == 'patient_followups' %}
+            COALESCE(TRY_TO_DATE(historico.CONTACT_DATE), TRY_TO_TIMESTAMP_NTZ(historico.CONTACT_DATE)::DATE)
+              BETWEEN TO_DATE('{{ inputs.fecha_inicio }}') AND TO_DATE('{{ inputs.fecha_fin }}')
+            AND
+          {% elseif item.value == 'patients' %}
+            COALESCE(TRY_TO_DATE(historico.REGISTERED_AT), TRY_TO_TIMESTAMP_NTZ(historico.REGISTERED_AT)::DATE)
+              BETWEEN TO_DATE('{{ inputs.fecha_inicio }}') AND TO_DATE('{{ inputs.fecha_fin }}')
+            AND
+          {% elseif item.value == 'dentists' %}
+            COALESCE(TRY_TO_DATE(historico.JOINED_ON), TRY_TO_TIMESTAMP_NTZ(historico.JOINED_ON)::DATE)
+              BETWEEN TO_DATE('{{ inputs.fecha_inicio }}') AND TO_DATE('{{ inputs.fecha_fin }}')
+            AND
+          {% elseif item.value == 'treatment_lines' %}
+            EXISTS (
+              SELECT 1
+              FROM ORALSOLUTIONS_DW.RAW.APPOINTMENTS AS a
+              WHERE a.ID = historico.APPOINTMENT_ID
+                AND COALESCE(TRY_TO_DATE(a.SCHEDULED_AT), TRY_TO_TIMESTAMP_NTZ(a.SCHEDULED_AT)::DATE)
+                  BETWEEN TO_DATE('{{ inputs.fecha_inicio }}') AND TO_DATE('{{ inputs.fecha_fin }}')
+            )
+            AND
+          {% endif %}
+            NOT EXISTS (
+              SELECT 1
+              FROM ORALSOLUTIONS_DW.RAW.{{ item.value | upper }} AS existente
+              WHERE existente.ID = historico.ID
+            );
+        retry:
+          type: exponential
+          interval: PT5S
+          maxInterval: PT30S
+          maxAttempts: 3
+
+      # 2.4 VALIDAR TABLA RAW FINAL
+      - id: validar_backfill
+        type: io.kestra.plugin.jdbc.snowflake.Query
+        url: "{{ envs.snowflake_url }}"
+        username: "{{ envs.snowflake_user }}"
+        password: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+        role: ACCOUNTADMIN
+        warehouse: COMPUTE_WH
+        database: ORALSOLUTIONS_DW
+        schema: RAW
+        sql: |
+          SELECT
+            '{{ item.value }}' AS TABLA,
+            COUNT(*) AS TOTAL_REGISTROS,
+            COUNT(DISTINCT ID) AS IDS_DISTINTOS
+          FROM ORALSOLUTIONS_DW.RAW.{{ item.value | upper }};
+        fetchType: FETCH_ONE
+        retry:
+          type: exponential
+          interval: PT5S
+          maxInterval: PT30S
+          maxAttempts: 3
+
+      # 2.5 LIMPIAR TABLA TEMPORAL
+      - id: limpiar_backfill
+        type: io.kestra.plugin.jdbc.snowflake.Query
+        url: "{{ envs.snowflake_url }}"
+        username: "{{ envs.snowflake_user }}"
+        password: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+        role: ACCOUNTADMIN
+        warehouse: COMPUTE_WH
+        database: ORALSOLUTIONS_DW
+        schema: RAW
+        sql: |
+          DROP TABLE IF EXISTS
+            ORALSOLUTIONS_DW.RAW.{{ item.value | upper }}_BACKFILL_INCOMING;
+        retry:
+          type: exponential
+          interval: PT5S
+          maxInterval: PT30S
+          maxAttempts: 3
+
+# MANEJO GLOBAL DE ERRORES
+errors:
+  - id: registrar_error_backfill
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: >
+      Backfill fallido.
+      Ejecucion: {{ execution.id }}.
+      Fuente: {{ inputs.fuente }}.
+      Periodo: {{ inputs.fecha_inicio }} hasta {{ inputs.fecha_fin }}.
+      Revisar los logs de Kestra.

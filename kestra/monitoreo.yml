@@ -1,0 +1,35 @@
+id: monitoreo
+namespace: oralsolutions.mlops
+description: "Evalúa deriva de datos (PSI/KS/Chi2), deriva conceptual (PR-AUC) y alertas del servicio."
+
+tasks:
+  - id: consultar_alertas_servicio
+    type: io.kestra.plugin.core.http.Request
+    uri: "http://api:8000/alertas"
+    method: GET
+
+  - id: evaluar_alertas_lotes
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.14-slim
+    beforeCommands:
+      - pip install -q pandas
+    script: |
+      import json, pathlib, pandas as pd
+      ruta = pathlib.Path("docs/alertas.csv")
+      criticas = 0
+      if ruta.exists() and ruta.stat().st_size > 0:
+          df = pd.read_csv(ruta)
+          criticas = int((df["severidad"] == "Crítica").sum())
+      print(json.dumps({"alertas_criticas": criticas}))
+    outputFiles:
+      - "docs/alertas.csv"
+
+  - id: verificar_disparo_reentrenamiento
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ json(outputs.evaluar_alertas_lotes.vars).alertas_criticas > 0 }}"
+    then:
+      - id: disparar_reentrenamiento
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: oralsolutions.mlops
+        flowId: reentrenamiento
+        wait: false

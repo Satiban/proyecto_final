@@ -1,0 +1,14 @@
+oralsolutions:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "<TU_CUENTA_SNOWFLAKE>"
+      user: "<TU_USUARIO>"
+      # Contraseña en texto plano (sin Base64)
+      password: "<TU_CONTRASENA>"
+      role: ACCOUNTADMIN
+      database: ORALSOLUTIONS_DW
+      warehouse: COMPUTE_WH
+      schema: BRONZE
+      threads: 4
