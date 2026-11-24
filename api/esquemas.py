@@ -7,7 +7,7 @@ Valida tipos, rangos clínicos, categorías permitidas y consistencia de negocio
 from __future__ import annotations
 
 from typing import Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CodigoProcedimiento = Literal["CROWN", "EXTRACT", "FILL1", "FILL2", "ROOT", "WHITEN"]
 OdontologoKey = Literal["1", "2", "3", "4", "5"]
@@ -51,8 +51,10 @@ class SolicitudPrediccion(BaseModel):
             )
         return self
 
-    model_config = {
-        "json_schema_extra": {
+    model_config = ConfigDict(
+        strict=True,
+        extra="forbid",
+        json_schema_extra={
             "example": {
                 "duracion_estimada_min": 75,
                 "numero_sesion": 1,
@@ -65,7 +67,7 @@ class SolicitudPrediccion(BaseModel):
                 "odontologo_key": "2",
             }
         }
-    }
+    )
 
 
 class RespuestaSalud(BaseModel):

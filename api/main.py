@@ -4,7 +4,7 @@ API de servicio de predicción de abandono de tratamientos (OralSolutions).
 Endpoints principales:
 - GET  /salud          : Estado del servicio y carga del modelo.
 - GET  /modelo         : Nombre, versión, alias y run_id del modelo activo (detecta rollback sin reconstruir).
-- POST /predecir       : Valida entrada, construye features desde pipeline_proyecto.py, predice y registra.
+- POST /predecir       : Valida entrada, construye features desde src/pipeline.py, predice y registra.
 - GET  /metricas       : Métricas en vivo de sistema (latencia p50/p95, errores 4xx/5xx) y de modelo.
 - POST /admin/respaldo : Interruptor protegido para activar/desactivar el modo de respaldo (regla de negocio).
 """
@@ -14,6 +14,9 @@ from __future__ import annotations
 import base64
 import csv
 import json
+import logging
+import math
+import secrets
 import os
 import sys
 import time
@@ -23,6 +26,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from threading import RLock
 
 import mlflow
 import mlflow.sklearn
@@ -30,6 +34,9 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Request
 from mlflow.tracking import MlflowClient
+
+logger = logging.getLogger(__name__)
+BLOQUEO_MODELO = RLock()
 
 # Permitir importar src/pipeline.py sin copiar código
 BASE_SERVICIO = Path(__file__).resolve().parent
@@ -53,7 +60,8 @@ MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
 MODEL_NAME = os.getenv("MODEL_NAME", "oralsolutions-modelo")
 MODEL_ALIAS = os.getenv("MODEL_ALIAS", "champion")
 UMBRAL_DECISION = float(os.getenv("UMBRAL_DECISION", "0.01"))
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "oralsolutions-admin-token")
+UMBRAL_RESPALDO = 0.5
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 USAR_MODELO_LOCAL = os.getenv("USAR_MODELO_LOCAL", "false").lower() == "true"
 RUTA_MODELO_LOCAL = Path(
@@ -79,6 +87,10 @@ class EstadoServicio:
         self.alias: str = MODEL_ALIAS
         self.version: str = "desconocida"
         self.run_id: str = "desconocido"
+        self.umbral_decision: float = UMBRAL_DECISION
+        self.hash_dataset: str = ""
+        self.fecha_corte: str = ""
+        self.ultimo_error_modelo: str = ""
         self.modo_respaldo: bool = os.getenv("MODO_RESPALDO", "false").lower() == "true"
         self.motivo_respaldo: str = "Variable de entorno MODO_RESPALDO" if self.modo_respaldo else ""
 
@@ -97,52 +109,65 @@ estado = EstadoServicio()
 
 
 def cargar_modelo(forzar_mlflow: bool = False) -> bool:
-    """Carga el modelo desde MLflow Model Registry (o fixture local en CI)."""
-    if USAR_MODELO_LOCAL and not forzar_mlflow:
+    """Resuelve el alias y carga una versión concreta; usa fixture en CI."""
+    with BLOQUEO_MODELO:
         try:
-            if not RUTA_MODELO_LOCAL.exists():
-                raise FileNotFoundError(f"No existe modelo local en {RUTA_MODELO_LOCAL}")
-            estado.modelo = mlflow.sklearn.load_model(str(RUTA_MODELO_LOCAL))
-            if RUTA_META_LOCAL.exists():
+            if USAR_MODELO_LOCAL and not forzar_mlflow:
                 meta = json.loads(RUTA_META_LOCAL.read_text(encoding="utf-8"))
-                estado.nombre_modelo = meta.get("nombre_modelo", MODEL_NAME)
-                estado.alias = meta.get("alias", MODEL_ALIAS)
-                estado.version = str(meta.get("version", "local"))
-                estado.run_id = meta.get("run_id", "local")
+                modelo = mlflow.sklearn.load_model(str(RUTA_MODELO_LOCAL))
+                nombre = meta["nombre_modelo"]
+                alias = meta["alias"]
+                version = str(meta["version"])
+                run_id = meta["run_id"]
+                umbral = float(meta["umbral_decision"])
+                hash_dataset = meta.get("hash_dataset", "")
+                fecha_corte = meta.get("fecha_corte", "")
             else:
-                estado.version = "local"
-                estado.run_id = "local"
+                mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+                client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+                mv = client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
+                version = str(mv.version)
+                nombre, alias, run_id = MODEL_NAME, MODEL_ALIAS, mv.run_id
+                run = client.get_run(run_id)
+                umbral = float(mv.tags.get("umbral_decision", run.data.params.get("umbral_negocio")))
+                hash_dataset = run.data.params.get("hash_dataset", "")
+                fecha_corte = run.data.params.get("fecha_corte", "")
+                if (estado.modelo_cargado and estado.modelo is not None
+                    and estado.version == version and estado.run_id == run_id
+                    and estado.nombre_modelo == nombre):
+                    modelo = estado.modelo
+                else:
+                    modelo = mlflow.sklearn.load_model(f"models:/{nombre}/{version}")
+
+            if not math.isfinite(umbral) or not 0 <= umbral <= 1:
+                raise ValueError("Umbral inválido")
+            if list(modelo.feature_names_in_) != FEATURES_FINALES:
+                raise ValueError("Features incompatibles con src/pipeline.py")
+            if list(modelo.classes_) != [0, 1] or not hasattr(modelo, "predict_proba"):
+                raise ValueError("Clasificador incompatible")
+
+            estado.modelo = modelo
             estado.modelo_cargado = True
+            estado.nombre_modelo = nombre
+            estado.alias = alias
+            estado.version = version
+            estado.run_id = run_id
+            estado.umbral_decision = umbral
+            estado.hash_dataset = hash_dataset
+            estado.fecha_corte = fecha_corte
+            estado.ultimo_error_modelo = ""
             return True
-        except Exception:
+        except Exception as exc:
+            logger.exception("No se pudo cargar el modelo; se utilizará el respaldo")
             estado.modelo = None
             estado.modelo_cargado = False
             estado.version = "fallback-regla-negocio"
             estado.run_id = "fallback"
+            estado.umbral_decision = UMBRAL_RESPALDO
+            estado.hash_dataset = ""
+            estado.fecha_corte = ""
+            estado.ultimo_error_modelo = type(exc).__name__
             return False
-
-    try:
-        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-        client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-        mv = client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
-        nueva_version = str(mv.version)
-
-        # Solo recargar el artefacto si no está cargado o cambió la versión del alias (rollback/promoción)
-        if (not estado.modelo_cargado) or (estado.version != nueva_version):
-            uri = f"models:/{MODEL_NAME}@{MODEL_ALIAS}"
-            estado.modelo = mlflow.sklearn.load_model(uri)
-            estado.nombre_modelo = MODEL_NAME
-            estado.alias = MODEL_ALIAS
-            estado.version = nueva_version
-            estado.run_id = mv.run_id
-            estado.modelo_cargado = True
-        return True
-    except Exception:
-        estado.modelo = None
-        estado.modelo_cargado = False
-        estado.version = "fallback-regla-negocio"
-        estado.run_id = "fallback"
-        return False
 
 
 def predecir_regla_respaldo(df_features: pd.DataFrame) -> float:
@@ -168,7 +193,11 @@ def registrar_prediccion(registro: dict[str, Any]) -> None:
                 writer.writeheader()
             writer.writerow(registro)
     except Exception:
-        pass
+        logger.exception(
+            "Error al registrar predicción en CSV. "
+            "ID de predicción: %s",
+            registro["id_prediccion"]
+        )
 
     if not REGISTRAR_SNOWFLAKE:
         return
@@ -184,7 +213,7 @@ def registrar_prediccion(registro: dict[str, Any]) -> None:
             password=password,
             warehouse=os.getenv("SF_WAREHOUSE", "COMPUTE_WH"),
             database=os.getenv("SF_DATABASE", "ORALSOLUTIONS_DW"),
-            schema=os.getenv("SF_OBT_SCHEMA", "OBT"),
+            schema=os.getenv("SF_MLOPS_SCHEMA", "MLOPS"),
             role=os.getenv("SF_ROLE", "ACCOUNTADMIN"),
         )
         try:
@@ -211,8 +240,11 @@ def registrar_prediccion(registro: dict[str, Any]) -> None:
         finally:
             conn.close()
     except Exception:
-        # El fallo en el registro externo no debe tumbar la inferencia
-        pass
+        logger.exception(
+            "Error al registrar predicción en Snowflake. "
+            "ID de predicción: %s",
+            registro["id_prediccion"]
+        )
 
 
 @asynccontextmanager
@@ -257,18 +289,17 @@ def salud() -> RespuestaSalud:
 
 @app.get("/modelo", response_model=RespuestaModelo)
 def info_modelo() -> RespuestaModelo:
-    # Sincronizar con MLflow para reflejar rollback/promoción sin reconstruir la imagen
-    if not USAR_MODELO_LOCAL:
-        cargar_modelo()
-
-    return RespuestaModelo(
-        nombre_modelo=estado.nombre_modelo,
-        version=estado.version,
-        alias=estado.alias,
-        run_id=estado.run_id,
-        umbral_decision=UMBRAL_DECISION,
-        modo_respaldo=estado.modo_respaldo or (not estado.modelo_cargado),
-    )
+    with BLOQUEO_MODELO:
+        if not USAR_MODELO_LOCAL:
+            cargar_modelo()
+        return RespuestaModelo(
+            nombre_modelo=estado.nombre_modelo,
+            version=estado.version,
+            alias=estado.alias,
+            run_id=estado.run_id,
+            umbral_decision=estado.umbral_decision,
+            modo_respaldo=estado.modo_respaldo or not estado.modelo_cargado,
+        )
 
 
 @app.post("/predecir", response_model=RespuestaPrediccion)
@@ -277,25 +308,27 @@ def predecir(solicitud: SolicitudPrediccion) -> RespuestaPrediccion:
     id_pred = str(uuid.uuid4())
     ts_utc = datetime.now(timezone.utc).isoformat()
 
-    # 1. Construir features importando directamente pipeline_proyecto.py
+    # 1. Construir features importando directamente src/pipeline.py
     datos_entrada = solicitud.model_dump()
     df_raw = pd.DataFrame([datos_entrada])
     df_feat = construir_features(df_raw)[FEATURES_FINALES]
 
-    # 2. Verificar si usar modelo o respaldo (por interruptor o fallo de carga)
-    usar_respaldo = estado.modo_respaldo or (not estado.modelo_cargado) or (estado.modelo is None)
-
-    if usar_respaldo:
-        prob = predecir_regla_respaldo(df_feat)
-        version_usada = "fallback-regla-1-sesion"
-        run_usado = "fallback"
-    else:
-        prob = float(estado.modelo.predict_proba(df_feat)[:, 1][0])
-        version_usada = estado.version
-        run_usado = estado.run_id
-
-    prob = round(prob, 6)
-    decision = "contactar" if prob >= UMBRAL_DECISION else "no_contactar"
+    # 2. Resolver champion y capturar metadatos coherentes con la predicción.
+    with BLOQUEO_MODELO:
+        if not USAR_MODELO_LOCAL and not estado.modo_respaldo:
+            cargar_modelo()
+        usar_respaldo = estado.modo_respaldo or not estado.modelo_cargado or estado.modelo is None
+        if usar_respaldo:
+            prob = predecir_regla_respaldo(df_feat)
+            version_usada = "fallback-regla-1-sesion"
+            run_usado = "fallback"
+            umbral_aplicado = UMBRAL_RESPALDO
+        else:
+            prob = float(estado.modelo.predict_proba(df_feat)[:, 1][0])
+            version_usada = estado.version
+            run_usado = estado.run_id
+            umbral_aplicado = estado.umbral_decision
+        decision = "contactar" if prob >= umbral_aplicado else "no_contactar"
     accion = (
         "Priorizar recordatorio personalizado y seguimiento preventivo de recepción"
         if decision == "contactar"
@@ -331,7 +364,7 @@ def predecir(solicitud: SolicitudPrediccion) -> RespuestaPrediccion:
         probabilidad=prob,
         decision=decision,
         accion=accion,
-        umbral_aplicado=UMBRAL_DECISION,
+        umbral_aplicado=umbral_aplicado,
         version_modelo=version_usada,
         run_id=run_usado,
         uso_respaldo=usar_respaldo,
@@ -420,15 +453,18 @@ def cambiar_respaldo(
     payload: SolicitudRespaldo,
     x_admin_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    if x_admin_token != ADMIN_TOKEN:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="Interruptor administrativo no configurado.")
+    if not x_admin_token or not secrets.compare_digest(x_admin_token.encode("utf-8"), ADMIN_TOKEN.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Token de administrador inválido.")
 
-    estado.modo_respaldo = payload.activar
-    estado.motivo_respaldo = payload.motivo
-    return {
-        "modo_respaldo": estado.modo_respaldo,
-        "motivo": estado.motivo_respaldo,
-        "mensaje": "Modo respaldo activado (regla de negocio)."
-        if estado.modo_respaldo
-        else "Modo respaldo desactivado (modelo ML activo).",
-    }
+    with BLOQUEO_MODELO:
+        estado.modo_respaldo = payload.activar
+        estado.motivo_respaldo = payload.motivo
+        respaldo_efectivo = estado.modo_respaldo or not estado.modelo_cargado
+        return {
+            "modo_respaldo": estado.modo_respaldo,
+            "respaldo_efectivo": respaldo_efectivo,
+            "motivo": estado.motivo_respaldo,
+            "mensaje": "Modo respaldo activo." if respaldo_efectivo else "Modelo ML activo.",
+        }

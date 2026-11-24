@@ -119,7 +119,7 @@ services:
       MODEL_ALIAS: champion
       UMBRAL_DECISION: "0.01"
       USAR_MODELO_LOCAL: "false"
-      REGISTRAR_SNOWFLAKE: "false"
+      REGISTRAR_SNOWFLAKE: "true"
     volumes:
       - datos_mlflow:/mlflow
     ports:
