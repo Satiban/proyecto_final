@@ -1,35 +1,58 @@
 id: monitoreo
 namespace: oralsolutions.mlops
-description: "Evalúa deriva de datos (PSI/KS/Chi2), deriva conceptual (PR-AUC) y alertas del servicio."
+
+description: >
+  Monitoreo inmediato, evaluación de targets madurados
+  y persistencia de alertas en Snowflake.
+
+inputs:
+  - id: lote
+    type: INT
+    required: true
+    defaults: 0
+    min: 0
+    max: 14
+
+  - id: fecha_virtual
+    type: STRING
+    required: false
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
 
 tasks:
-  - id: consultar_alertas_servicio
-    type: io.kestra.plugin.core.http.Request
-    uri: "http://api:8000/alertas"
-    method: GET
+  - id: ejecutar_monitoreo_temporal
+    type: io.kestra.plugin.scripts.python.Commands
 
-  - id: evaluar_alertas_lotes
-    type: io.kestra.plugin.scripts.python.Script
     containerImage: python:3.14-slim
-    beforeCommands:
-      - pip install -q pandas
-    script: |
-      import json, pathlib, pandas as pd
-      ruta = pathlib.Path("docs/alertas.csv")
-      criticas = 0
-      if ruta.exists() and ruta.stat().st_size > 0:
-          df = pd.read_csv(ruta)
-          criticas = int((df["severidad"] == "Crítica").sum())
-      print(json.dumps({"alertas_criticas": criticas}))
-    outputFiles:
-      - "docs/alertas.csv"
 
-  - id: verificar_disparo_reentrenamiento
-    type: io.kestra.plugin.core.flow.If
-    condition: "{{ json(outputs.evaluar_alertas_lotes.vars).alertas_criticas > 0 }}"
-    then:
-      - id: disparar_reentrenamiento
-        type: io.kestra.plugin.core.flow.Subflow
-        namespace: oralsolutions.mlops
-        flowId: reentrenamiento
-        wait: false
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: proyecto_final_default
+      volumes:
+        - "{{ envs.kestra_host_project_path }}:/proyecto:ro"
+
+    env:
+      API_URL: http://api:8000
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      NUMERO_LOTE: "{{ inputs.lote }}"
+      FECHA_VIRTUAL: "{{ inputs.fecha_virtual ?? '' }}"
+
+    beforeCommands:
+      - pip install -q -r /proyecto/api/requirements.txt
+      - pip install -q python-dotenv==1.2.1
+
+    commands:
+      - cd /proyecto
+      - |
+        if [ -n "$FECHA_VIRTUAL" ]; then
+          python -m monitoreo.orquestar_monitoreo \
+            --lote "$NUMERO_LOTE" \
+            --fecha-virtual "$FECHA_VIRTUAL"
+        else
+          python -m monitoreo.orquestar_monitoreo \
+            --lote "$NUMERO_LOTE"
+        fi
