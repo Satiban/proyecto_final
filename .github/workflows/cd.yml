@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-      - master
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -33,7 +31,7 @@ jobs:
         env:
           USAR_MODELO_LOCAL: "true"
           REGISTRAR_SNOWFLAKE: "false"
-        run: pytest tests -v
+        run: python -m pytest tests/ -v --tb=short
 
   publicar-imagen:
     needs: validar

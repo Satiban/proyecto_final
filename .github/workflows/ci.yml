@@ -28,7 +28,7 @@ jobs:
         env:
           USAR_MODELO_LOCAL: "true"
           REGISTRAR_SNOWFLAKE: "false"
-        run: pytest tests -v
+        run: python -m pytest tests/ -v --tb=short
 
       - name: Verificar construcción de imagen Docker de la API
         run: docker build -f api/Dockerfile -t oralsolutions-api:ci .
