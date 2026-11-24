@@ -1,67 +1,60 @@
 id: reentrenamiento
 namespace: oralsolutions.mlops
-description: "Reentrenamiento controlado con pausa de aprobación humana antes de promover @challenger a @champion."
-
+description: Revisión por calendario, comparación temporal y aprobación humana.
 inputs:
-  - id: lote_eval
+  - id: fecha_virtual
     type: STRING
-    defaults: "L10_deriva_conceptual"
-  - id: motivo_disparo
-    type: STRING
-    defaults: "Alerta crítica de deriva conceptual (PR-AUC < 0.960)"
-
+    required: true
+    defaults: "2026-01-01"
+concurrency:
+  limit: 1
+  behavior: QUEUE
 tasks:
   - id: entrenar_challenger
     type: io.kestra.plugin.scripts.python.Commands
+    containerImage: python:3.14-slim
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
-      networkMode: pset_2_default
-    containerImage: python:3.14-slim
+      networkMode: proyecto_final_default
+      volumes:
+        - "{{ envs.kestra_host_project_path }}:/proyecto:ro"
     env:
-      MLFLOW_TRACKING_URI: "http://mlflow:5000"
-      MODEL_NAME: "oralsolutions-modelo"
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      PYTHONDONTWRITEBYTECODE: "1"
+      FECHA_VIRTUAL: "{{ inputs.fecha_virtual }}"
     beforeCommands:
-      - pip install -q mlflow-skinny scikit-learn pandas numpy scipy
+      - pip install -q -r /proyecto/api/requirements.txt python-dotenv==1.2.1
     commands:
-      - >
-        python src/reentrenar.py
-        --lote-eval "{{ inputs.lote_eval }}"
-        --motivo "{{ inputs.motivo_disparo }}"
-        --decision pendiente
-
+      - cd /proyecto
+      - python -m src.reentrenar entrenar --fecha-virtual "$FECHA_VIRTUAL"
   - id: pausa_aprobacion_humana
     type: io.kestra.plugin.core.flow.Pause
-    description: "Revisión manual de métricas @champion vs @challenger antes de promover."
+    description: Revisar costos y PR-AUC en los logs antes de decidir.
     onResume:
       - id: decision_humana
         type: SELECT
-        values:
-          - aprobar
-          - rechazar
+        required: true
+        values: [aprobar, rechazar]
         defaults: rechazar
       - id: motivo_decision
         type: STRING
-        defaults: "Rechazado tras revisión humana: no cumple regla de promoción."
-
+        required: true
   - id: aplicar_decision_promocion
-    type: io.kestra.plugin.scripts.python.Script
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: python:3.14-slim
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
-      networkMode: pset_2_default
-    containerImage: python:3.14-slim
+      networkMode: proyecto_final_default
+      volumes:
+        - "{{ envs.kestra_host_project_path }}:/proyecto:ro"
     env:
-      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUN_ID: "{{ outputs.entrenar_challenger.vars.run_id }}"
+      DECISION: "{{ outputs.pausa_aprobacion_humana.onResume.decision_humana }}"
+      MOTIVO: "{{ outputs.pausa_aprobacion_humana.onResume.motivo_decision }}"
     beforeCommands:
-      - pip install -q mlflow-skinny
-    script: |
-      from mlflow.tracking import MlflowClient
-      decision = "{{ outputs.pausa_aprobacion_humana.onResume.decision_humana }}"
-      motivo = "{{ outputs.pausa_aprobacion_humana.onResume.motivo_decision }}"
-      client = MlflowClient("http://mlflow:5000")
-      if decision == "aprobar":
-          mv = client.get_model_version_by_alias("oralsolutions-modelo", "challenger")
-          client.set_registered_model_alias("oralsolutions-modelo", "champion", mv.version)
-          print(f"[PROMOVIDO] @champion -> v{mv.version}. Motivo: {motivo}")
-      else:
-          mv = client.get_model_version_by_alias("oralsolutions-modelo", "champion")
-          print(f"[INTACTO] @champion permanece en v{mv.version}. Motivo: {motivo}")
+      - pip install -q -r /proyecto/api/requirements.txt python-dotenv==1.2.1
+    commands:
+      - cd /proyecto
+      - python -m src.reentrenar decidir --run-id "$RUN_ID" --decision "$DECISION" --motivo "$MOTIVO"

@@ -1,277 +1,157 @@
-"""
-Tubería de reentrenamiento controlado — OralSolutions (PSet 4, Sección 7).
-
-Flujo:
-1. Arma la ventana de reentrenamiento (histórico + lotes etiquetados sanos L01-L08).
-2. Reentrena usando pipeline_proyecto.py con los hiperparámetros exactos de @champion
-   (sin repetir búsqueda de hiperparámetros).
-3. Registra la corrida en MLflow con tag `fase=reentrenamiento` y el motivo del disparo.
-4. Registra la nueva versión en Model Registry con el alias `@challenger`.
-5. Evalúa @champion y @challenger sobre el lote etiquetado más reciente no visto (L10).
-6. Aplica la regla de promoción y ejecuta la decisión humana (--decision pendiente|aprobar|rechazar).
-7. Exporta docs/corridas.csv y docs/reentrenamientos.csv desde MLflow.
-"""
-
+"""Reentrenamiento por calendario, evaluación temporal y aprobación separada."""
 from __future__ import annotations
-
 import argparse
 import json
 import os
-import sys
-import time
 from pathlib import Path
-
+import hashlib
+import pandas as pd
+import numpy as np
 import mlflow
 import mlflow.sklearn
-import numpy as np
-import pandas as pd
-from mlflow.models import infer_signature
 from mlflow.tracking import MlflowClient
+from mlflow.models import infer_signature
 from sklearn.base import clone
 from sklearn.metrics import average_precision_score, confusion_matrix, precision_score, recall_score
+from src.datos import conectar_snowflake, consultar_dataframe, validar_fuentes, construir_dataset
+from src.pipeline import construir_features, construir_pipeline, FEATURES_FINALES, TARGET, FECHA_EVENTO
 
-BASE_MODELADO = Path(__file__).resolve().parent
-BASE_PROYECTO = BASE_MODELADO.parent
-if str(BASE_PROYECTO) not in sys.path:
-    sys.path.insert(0, str(BASE_PROYECTO))
-
-from src.pipeline import (
-    FECHA_CORTE,
-    FECHA_EVENTO,
-    FEATURES_FINALES,
-    SEMILLA,
-    TARGET,
-    cargar_datos,
-    construir_features,
-    construir_pipeline,
-)
-from monitoreo.deriva import PR_AUC_CV_STD
-
-TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
-EXPERIMENT_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "OralSolutions_Reentrenamiento")
-MODEL_NAME = os.getenv("MODEL_NAME", "oralsolutions-modelo")
-UMBRAL_DECISION = float(os.getenv("UMBRAL_DECISION", "0.01"))
-
-COSTO_FN = 120.0
-COSTO_FP = 3.0
-INGRESO_RESCATE = COSTO_FN * 0.35  # $42 USD
+ROOT = Path(__file__).resolve().parent.parent
+URI = os.getenv('MLFLOW_TRACKING_URI', 'http://127.0.0.1:5000')
+NAME = os.getenv('MODEL_NAME', 'oralsolutions-modelo')
+SCHEMA = 'ORALSOLUTIONS_DW.MLOPS'
+SNAP = 'SNAP_SIM_2025_V1'
+FECHA_EVAL_INICIO = pd.Timestamp('2025-10-27')
+FECHA_EVAL_FIN = pd.Timestamp('2025-11-01')
+LIMITE_TRAIN = FECHA_EVAL_INICIO - pd.Timedelta(days=61)
+FECHA_CALENDARIO = pd.Timestamp('2026-01-01')
 
 
-def evaluar_modelo_lote(modelo, X_eval: pd.DataFrame, y_eval: np.ndarray) -> dict[str, float]:
-    probs = modelo.predict_proba(X_eval)[:, 1]
-    preds = (probs >= UMBRAL_DECISION).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_eval, preds, labels=[0, 1]).ravel()
-    costo = float(fn * COSTO_FN + fp * COSTO_FP)
-    balance = float(tp * (INGRESO_RESCATE - COSTO_FP) - fp * COSTO_FP - fn * COSTO_FN)
-    return {
-        "pr_auc": round(float(average_precision_score(y_eval, probs)), 5),
-        "recall": round(float(recall_score(y_eval, preds, zero_division=0)), 4),
-        "precision": round(float(precision_score(y_eval, preds, zero_division=0)), 4),
-        "costo_errores_usd": round(costo, 2),
-        "balance_neto_usd": round(balance, 2),
-        "FP": int(fp),
-        "FN": int(fn),
-    }
+def evaluar(modelo, df, umbral):
+    y = df[TARGET].astype(int).to_numpy()
+    p = modelo.predict_proba(df[FEATURES_FINALES])[:, list(modelo.classes_).index(1)]
+    d = (p >= umbral).astype(int)
+    tn, fp, fn, tp = map(int, confusion_matrix(y, d, labels=[0, 1]).ravel())
+    return dict(pr_auc=float(average_precision_score(y,p)), precision=float(precision_score(y,d,zero_division=0)),
+                recall=float(recall_score(y,d,zero_division=0)), costo_errores_usd=float(120*fn+3*fp),
+                tp=tp, fp=fp, fn=fn, tn=tn, tasa_contactar=float(d.mean()))
 
 
-def exportar_evidencias_mlflow() -> None:
-    docs_dir = BASE_PROYECTO / "docs"
-    docs_dir.mkdir(parents=True, exist_ok=True)
-
-    df_runs = mlflow.search_runs(search_all_experiments=True)
-    df_runs.to_csv(docs_dir / "corridas.csv", index=False)
-
-    col_fase = "tags.fase"
-    if col_fase in df_runs.columns:
-        df_reent = df_runs[df_runs[col_fase] == "reentrenamiento"].copy()
-    else:
-        df_reent = df_runs.iloc[0:0].copy()
-    df_reent.to_csv(docs_dir / "reentrenamientos.csv", index=False)
-
-    print(f"[OK] Exportadas {len(df_runs)} corridas totales -> docs/corridas.csv")
-    print(f"[OK] Exportadas {len(df_reent)} corridas de reentrenamiento -> docs/reentrenamientos.csv")
-
-
-def ejecutar_reentrenamiento(
-    motivo: str,
-    lote_eval: str,
-    decision: str,
-    motivo_decision: str,
-) -> None:
-    mlflow.set_tracking_uri(TRACKING_URI)
-    client = MlflowClient(tracking_uri=TRACKING_URI)
-
-    # Crear o usar experimento nuevo para que MLflow sirva artefactos 100% por HTTP
-    mlflow.set_experiment(EXPERIMENT_NAME)
-
-    # 1. Cargar @champion actual y extraer su estimador (hiperparámetros sin repetir tuning)
-    mv_champ = client.get_model_version_by_alias(MODEL_NAME, "champion")
+def dataset():
+    conn = conectar_snowflake()
     try:
-        champion = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@champion")
-    except OSError:
-        ruta_fixture = BASE_PROYECTO / "tests" / "fixtures" / "modelo_champion"
-        champion = mlflow.sklearn.load_model(str(ruta_fixture))
-    estimador_base = clone(champion.named_steps["modelo"])
-
-    # 2. Armar ventana de datos: histórico (< 2025-08-01) + lotes etiquetados reales L01..L08
-    df_hist = construir_features(cargar_datos())
-    df_train_hist = df_hist[df_hist[FECHA_EVENTO] < pd.Timestamp(FECHA_CORTE)].copy()
-
-    ruta_lotes = BASE_PROYECTO / "monitoreo" / "lotes_simulados.csv"
-    if not ruta_lotes.exists():
-        raise FileNotFoundError(
-            "No existe monitoreo/lotes_simulados.csv. Ejecuta primero monitoreo/simular_produccion.py"
-        )
-    df_lotes = pd.read_csv(ruta_lotes)
-    df_lotes = construir_features(df_lotes)
-
-    # Solo lotes reales con target ya disponible (L01-L08); se excluye L09 (deriva de datos) y L10 (evaluación)
-    lotes_train_ids = [f"L{i:02d}" for i in range(1, 9)]
-    df_lotes_train = df_lotes[df_lotes["lote_id"].isin(lotes_train_ids)].copy()
-    df_eval = df_lotes[df_lotes["lote_id"] == lote_eval].copy()
-    if df_eval.empty:
-        raise ValueError(f"El lote de evaluación '{lote_eval}' no existe en lotes_simulados.csv")
-
-    df_ventana = pd.concat(
-        [df_train_hist[FEATURES_FINALES + [TARGET]], df_lotes_train[FEATURES_FINALES + [TARGET]]],
-        ignore_index=True,
-    )
-    X_ventana = df_ventana[FEATURES_FINALES].copy()
-    y_ventana = df_ventana[TARGET].astype(int).to_numpy()
-
-    X_eval = df_eval[FEATURES_FINALES].copy()
-    y_eval = df_eval[TARGET].astype(int).to_numpy()
-
-    # 3. Reentrenar usando exactamente pipeline_proyecto.py
-    nuevo_pipe = construir_pipeline(estimador_base, escalar_numericas=True)
-
-    with mlflow.start_run(run_name=f"REENTRENAMIENTO_{lote_eval}") as run:
-        t0 = time.perf_counter()
-        nuevo_pipe.fit(X_ventana, y_ventana)
-        segundos = round(time.perf_counter() - t0, 4)
-
-        # 4. Evaluar @champion y @challenger sobre el mismo lote no visto (L10)
-        res_champ = evaluar_modelo_lote(champion, X_eval, y_eval)
-        res_chall = evaluar_modelo_lote(nuevo_pipe, X_eval, y_eval)
-
-        # Regla de promoción de docs/despliegue.md
-        mejora_negocio = res_chall["costo_errores_usd"] < res_champ["costo_errores_usd"]
-        estable_tecnica = res_chall["pr_auc"] >= (res_champ["pr_auc"] - PR_AUC_CV_STD)
-        cumple_regla = bool(mejora_negocio and estable_tecnica)
-
-        mlflow.log_params(
-            {
-                "ventana_datos": "historico_mas_L01_a_L08",
-                "n_filas_entrenamiento": len(X_ventana),
-                "lote_evaluacion": lote_eval,
-                "n_filas_evaluacion": len(X_eval),
-                "champion_previo_version": str(mv_champ.version),
-                "semilla": SEMILLA,
-                "umbral_decision": UMBRAL_DECISION,
-            }
-        )
-        mlflow.log_metrics(
-            {
-                "pr_auc_champion_eval": res_champ["pr_auc"],
-                "pr_auc_challenger_eval": res_chall["pr_auc"],
-                "costo_champion_usd": res_champ["costo_errores_usd"],
-                "costo_challenger_usd": res_chall["costo_errores_usd"],
-                "balance_champion_usd": res_champ["balance_neto_usd"],
-                "balance_challenger_usd": res_chall["balance_neto_usd"],
-                "cumple_regla_promocion": int(cumple_regla),
-                "segundos_entrenamiento": segundos,
-            }
-        )
-        mlflow.set_tags(
-            {
-                "fase": "reentrenamiento",
-                "motivo_disparo": motivo,
-                "lote_evaluacion": lote_eval,
-                "cumple_regla_promocion": str(cumple_regla),
-                "decision_humana": decision,
-                "motivo_decision": motivo_decision,
-            }
-        )
-
-        input_example = X_ventana.iloc[:5].copy()
-        signature = infer_signature(input_example, nuevo_pipe.predict_proba(input_example))
-        mlflow.sklearn.log_model(
-            sk_model=nuevo_pipe,
-            artifact_path="model",
-            signature=signature,
-            input_example=input_example,
-            registered_model_name=MODEL_NAME,
-        )
-        new_run_id = run.info.run_id
-
-    # 5. Asignar alias @challenger a la nueva versión creada
-    versiones = client.search_model_versions(f"name='{MODEL_NAME}'")
-    mv_nuevo = max(versiones, key=lambda v: int(v.version))
-    nueva_version = str(mv_nuevo.version)
-    client.set_registered_model_alias(MODEL_NAME, "challenger", nueva_version)
-
-    # 6. Aplicar decisión humana (promover o mantener champion intacto)
-    promovido = False
-    if decision == "aprobar":
-        client.set_registered_model_alias(MODEL_NAME, "champion", nueva_version)
-        promovido = True
-
-    resumen = {
-        "motivo_disparo": motivo,
-        "ventana_entrenamiento": f"historico ({len(df_train_hist)}) + L01-L08 ({len(df_lotes_train)}) = {len(X_ventana)} filas",
-        "lote_evaluacion": lote_eval,
-        "champion_actual": {"version": str(mv_champ.version), "run_id": mv_champ.run_id, **res_champ},
-        "challenger_nuevo": {"version": nueva_version, "run_id": new_run_id, **res_chall},
-        "cumple_regla_promocion": cumple_regla,
-        "decision_humana": decision,
-        "motivo_decision": motivo_decision,
-        "promovido_a_champion": promovido,
-    }
-
-    ruta_resumen = BASE_PROYECTO / "monitoreo" / "ultimo_reentrenamiento.json"
-    ruta_resumen.write_text(json.dumps(resumen, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    print("\n=== RESULTADO DEL REENTRENAMIENTO ===")
-    print(f"Ventana datos       : {resumen['ventana_entrenamiento']}")
-    print(f"Lote evaluación     : {lote_eval} ({len(X_eval)} sesiones, no visto en entrenamiento)")
-    print(
-        f"@champion  (v{mv_champ.version})   : PR-AUC={res_champ['pr_auc']} | "
-        f"Costo=${res_champ['costo_errores_usd']} | Balance=${res_champ['balance_neto_usd']}"
-    )
-    print(
-        f"@challenger (v{nueva_version})  : PR-AUC={res_chall['pr_auc']} | "
-        f"Costo=${res_chall['costo_errores_usd']} | Balance=${res_chall['balance_neto_usd']}"
-    )
-    print(f"¿Cumple regla?      : {cumple_regla}")
-    print(f"Decisión humana     : {decision} ({motivo_decision})")
-    if promovido:
-        print(f"[PROMOVIDO] Alias @champion movido a v{nueva_version} (API toma el cambio sin reconstruir).")
-    else:
-        print(f"[INTACTO] Alias @champion permanece en v{mv_champ.version}; v{nueva_version} queda como @challenger.")
-
-    exportar_evidencias_mlflow()
+        obt = consultar_dataframe(conn, f'SELECT * FROM {SCHEMA}.{SNAP}_OBT')
+        gold = consultar_dataframe(conn, f'''SELECT SESION_KEY, PLAN_TRATAMIENTO_ID, NUMERO_SESION, FECHA_REALIZADA
+          FROM {SCHEMA}.{SNAP}_GOLD WHERE INDICADOR_COMPLETADA=1 AND FECHA_REALIZADA IS NOT NULL''')
+    finally:
+        conn.close()
+    validar_fuentes(obt,gold)
+    df = construir_features(construir_dataset(obt,gold))
+    df[FECHA_EVENTO] = pd.to_datetime(df[FECHA_EVENTO])
+    return df.sort_values([FECHA_EVENTO,'sesion_key']).reset_index(drop=True)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Reentrenamiento controlado OralSolutions")
-    parser.add_argument(
-        "--motivo",
-        default="Alerta critica de deriva conceptual en L10_deriva_conceptual (PR-AUC < 0.960)",
-    )
-    parser.add_argument("--lote-eval", default="L10_deriva_conceptual")
-    parser.add_argument(
-        "--decision",
-        choices=["pendiente", "aprobar", "rechazar"],
-        default="pendiente",
-    )
-    parser.add_argument(
-        "--motivo-decision",
-        default="Esperando aprobacion manual en flujo de Kestra",
-    )
-    args = parser.parse_args()
-    ejecutar_reentrenamiento(
-        motivo=args.motivo,
-        lote_eval=args.lote_eval,
-        decision=args.decision,
-        motivo_decision=args.motivo_decision,
-    )
+def huella(df):
+    return hashlib.sha256(df[['sesion_key',FECHA_EVENTO,*FEATURES_FINALES,TARGET]].to_csv(index=False).encode('utf-8')).hexdigest()
+
+
+def cliente():
+    mlflow.set_tracking_uri(URI)
+    return MlflowClient(tracking_uri=URI)
+
+
+def entrenar(fecha_virtual, motivo):
+    fecha = pd.Timestamp(fecha_virtual)
+    if fecha < FECHA_CALENDARIO:
+        raise ValueError('El disparador por calendario requiere fecha virtual >= 2026-01-01.')
+    c = cliente()
+    mv = c.get_model_version_by_alias(NAME,'champion')
+    corrida = c.get_run(mv.run_id).data
+    umbral = float(mv.tags.get('umbral_decision', corrida.params.get('umbral_negocio','0.01')))
+    std = float(corrida.metrics['pr_auc_cv_std'])
+    champion = mlflow.sklearn.load_model(f'models:/{NAME}/{mv.version}')
+    df = dataset()
+    train = df.loc[df[FECHA_EVENTO] <= LIMITE_TRAIN].copy()
+    test = df.loc[df[FECHA_EVENTO].between(FECHA_EVAL_INICIO,FECHA_EVAL_FIN)].copy()
+    if train.empty or len(test)!=81 or train[TARGET].nunique()!=2 or test[TARGET].nunique()!=2:
+        raise ValueError('Ventanas inesperadas o sin ambas clases.')
+    if train[FECHA_EVENTO].max()+pd.Timedelta(days=60)>=test[FECHA_EVENTO].min() or test[FECHA_EVENTO].max()+pd.Timedelta(days=60)>fecha:
+        raise ValueError('Horizonte temporal inválido.')
+    if set(train.sesion_key)&set(test.sesion_key):
+        raise ValueError('Sesiones repetidas entre ventanas.')
+    # Mismo estimador e hiperparámetros, mismo preprocesador del champion.
+    # Se usa el constructor compartido y se conserva su configuración exacta.
+    pipe = construir_pipeline(clone(champion.named_steps['modelo']))
+    pipe.set_params(preprocesador=clone(champion.named_steps['preprocesador']))
+    X=train[FEATURES_FINALES]; y=train[TARGET].astype(int)
+    # CV temporal por fechas, con purga de 60 días antes de cada validación.
+    fechas=sorted(train[FECHA_EVENTO].unique())
+    bloques=np.array_split(fechas,5)
+    scores=[]
+    for bloque in bloques[1:]:
+        ini=pd.Timestamp(bloque[0]); fin=pd.Timestamp(bloque[-1])
+        a=train.loc[train[FECHA_EVENTO]+pd.Timedelta(days=60)<ini]
+        b=train.loc[train[FECHA_EVENTO].between(ini,fin)]
+        if a[TARGET].nunique()!=2 or b[TARGET].nunique()!=2: continue
+        p=clone(pipe).fit(a[FEATURES_FINALES],a[TARGET].astype(int))
+        scores.append(evaluar(p,b,umbral)['pr_auc'])
+    if len(scores)<2: raise ValueError('CV temporal insuficiente.')
+    mlflow.set_experiment('OralSolutions_Reentrenamiento')
+    with mlflow.start_run(run_name='REENTRENAMIENTO_L14') as run:
+        pipe.fit(X,y)
+        a=evaluar(champion,test,umbral); b=evaluar(pipe,test,umbral)
+        cumple=bool(b['costo_errores_usd']<a['costo_errores_usd'] and b['pr_auc']>=a['pr_auc']-std)
+        mlflow.log_params(dict(snapshot_id=SNAP, hash_dataset=huella(df), hash_train=huella(train), hash_eval=huella(test),
+            fecha_corte=str(FECHA_EVAL_INICIO.date()), horizonte_dias=60, limite_train=str(LIMITE_TRAIN.date()),
+            fecha_virtual=str(fecha.date()), lote_evaluacion='L14', n_filas_entrenamiento=len(train),
+            n_filas_evaluacion=len(test), champion_previo_version=str(mv.version), champion_previo_run=mv.run_id,
+            umbral_negocio=umbral, tolerancia_cv=std, costo_fn=120,costo_fp=3))
+        mlflow.log_metrics({**{f'{k}_champion_eval':v for k,v in a.items()}, **{f'{k}_challenger_eval':v for k,v in b.items()},
+             'pr_auc_cv_mean':float(np.mean(scores)), 'pr_auc_cv_std':float(np.std(scores)), 'cumple_regla_promocion':int(cumple)})
+        mlflow.set_tags(dict(fase='reentrenamiento',motivo_disparo=motivo,decision_humana='pendiente',estado_promocion='pendiente'))
+        ejemplo=X.head(5)
+        mlflow.sklearn.log_model(pipe,artifact_path='model',signature=infer_signature(ejemplo,pipe.predict(ejemplo)),input_example=ejemplo)
+        rid=run.info.run_id
+    nuevo=mlflow.register_model(f'runs:/{rid}/model',NAME,await_registration_for=120)
+    v=str(nuevo.version)
+    c.set_model_version_tag(NAME,v,'umbral_decision',str(umbral))
+    c.set_tag(rid,'version_candidata',v)
+    c.set_registered_model_alias(NAME,'challenger',v)
+    print(json.dumps(dict(champion=dict(version=mv.version,**a),challenger=dict(version=v,**b),cumple_regla=cumple,
+          n_train=len(train),n_eval=len(test),limite_train=str(LIMITE_TRAIN.date()),fecha_virtual=str(fecha.date())),indent=2))
+    print('::'+json.dumps({'outputs':{'run_id':rid,'version':v,'cumple_regla':cumple}})+'::')
+
+
+def decidir(run_id, decision, motivo):
+    c=cliente(); r=c.get_run(run_id).data
+    if r.tags.get('fase')!='reentrenamiento' or r.tags.get('decision_humana')!='pendiente':
+        raise ValueError('La corrida no está pendiente de decisión.')
+    v=r.tags['version_candidata']; nuevo=c.get_model_version(NAME,v)
+    actual=c.get_model_version_by_alias(NAME,'champion')
+    if nuevo.run_id!=run_id or str(actual.version)!=r.params['champion_previo_version'] or actual.run_id!=r.params['champion_previo_run']:
+        raise RuntimeError('Cambió el candidato o champion desde la evaluación; revisar manualmente.')
+    cumple=(r.metrics['costo_errores_usd_challenger_eval']<r.metrics['costo_errores_usd_champion_eval'] and
+        r.metrics['pr_auc_challenger_eval']>=r.metrics['pr_auc_champion_eval']-float(r.params['tolerancia_cv']))
+    promovido=decision=='aprobar' and cumple
+    if promovido: c.set_registered_model_alias(NAME,'champion',v)
+    estado='promovido' if promovido else ('bloqueado_por_regla' if decision=='aprobar' else 'rechazado')
+    for k,val in dict(decision_humana=decision,motivo_decision=motivo,estado_promocion=estado).items(): c.set_tag(run_id,k,val)
+    print(f'[OK] {estado}; champion v{c.get_model_version_by_alias(NAME,"champion").version}; candidato v{v}; motivo: {motivo}')
+
+
+def exportar():
+    cliente(); docs=ROOT/'docs'; docs.mkdir(exist_ok=True)
+    runs=mlflow.search_runs(search_all_experiments=True)
+    runs.to_csv(docs/'corridas.csv',index=False)
+    runs.loc[runs['tags.fase'].eq('reentrenamiento')].to_csv(docs/'reentrenamientos.csv',index=False)
+    print('[OK] Corridas exportadas.')
+
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='accion',required=True)
+    t=sub.add_parser('entrenar'); t.add_argument('--fecha-virtual',default='2026-01-01'); t.add_argument('--motivo',default='Calendario: revision programada posterior a simulacion')
+    d=sub.add_parser('decidir'); d.add_argument('--run-id',required=True); d.add_argument('--decision',choices=['aprobar','rechazar'],required=True); d.add_argument('--motivo',required=True)
+    sub.add_parser('exportar'); a=p.parse_args()
+    if a.accion=='entrenar': entrenar(a.fecha_virtual,a.motivo)
+    elif a.accion=='decidir': decidir(a.run_id,a.decision,a.motivo)
+    else: exportar()
