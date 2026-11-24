@@ -1,14 +1,3 @@
-"""
-Pipeline reproducible sin fuga de datos (Etapa 3 - OralSolutions).
-
-Encapsula:
-1. Carga del dataset limpio y cálculo de su huella SHA-256.
-2. Ingeniería de características determinista (disponibles al cierre de la sesión).
-3. División temporal única (entrenamiento histórico vs. hold-out reciente).
-4. Preprocesamiento con ColumnTransformer (imputación, escalado robusto y One-Hot)
-   ajustado exclusivamente sobre el conjunto de entrenamiento.
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -31,7 +20,10 @@ TARGET = "abandono_60d"
 FECHA_EVENTO = "fecha_realizada"
 FECHAS = ["fecha_realizada", "fecha_inicio_plan"]
 
-# Corte temporal (65.25% train histórico: 1,551 filas < 2025-08-01 | 34.75% test hold-out: 826 filas >= 2025-08-01)
+# División temporal con horizonte de 60 días:
+# Train: hasta 2025-06-02 (1195 observaciones).
+# Gap: 2025-06-03 a 2025-07-31 (356 observaciones).
+# Test: desde 2025-08-01 (826 observaciones).
 FECHA_CORTE = "2025-08-01"
 
 FEATURES_NUM = [
@@ -132,47 +124,75 @@ def construir_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Asegurar tipo string en categóricas nominales
     for col in FEATURES_CAT:
-        datos[col] = datos[col].astype(str)
-
+        datos[col] = datos[col].astype("string").astype(object)
     # Verificación estricta contra fuga de datos
     fugas = set(FEATURES_FINALES).intersection(COLUMNAS_PROHIBIDAS | {TARGET})
     assert not fugas, f"Fuga de datos detectada en FEATURES_FINALES: {fugas}"
 
     return datos
 
-
 def dividir_datos_temporal(
     df: pd.DataFrame,
     fecha_corte: str = FECHA_CORTE,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     """
-    Aplica la división temporal única:
-    - Entrenamiento: sesiones anteriores a `fecha_corte`.
-    - Prueba (hold-out): sesiones desde `fecha_corte` en adelante.
+    División temporal con maduración del target a 60 días.
 
-    Justificación: el modelo predice riesgo futuro a partir de sesiones clínicas
-    en el tiempo (2024-2025) y el 73.7% de filas pertenecen a pacientes con
-    múltiples visitas; una división aleatoria mezclaría sesiones futuras en train.
+    Entrenamiento:
+        fecha_realizada + 60 días <= fecha_corte.
+
+    Hold-out:
+        fecha_realizada >= fecha_corte.
+
+    Las observaciones intermedias quedan excluidas para
+    evitar entrenar con etiquetas no disponibles al corte.
     """
-    datos = construir_features(df)
-    corte_ts = pd.Timestamp(fecha_corte)
 
-    mask_train = datos[FECHA_EVENTO] < corte_ts
+    datos = construir_features(df)
+
+    corte_ts = pd.Timestamp(fecha_corte)
+    horizonte = pd.Timedelta(days=60)
+    limite_train = corte_ts - horizonte
+
+    mask_train = datos[FECHA_EVENTO] <= limite_train
     mask_test = datos[FECHA_EVENTO] >= corte_ts
 
     train_df = datos.loc[mask_train].copy()
     test_df = datos.loc[mask_test].copy()
 
-    assert len(train_df) > 0 and len(test_df) > 0, "La fecha de corte deja un conjunto vacío"
-    assert train_df[FECHA_EVENTO].max() < test_df[FECHA_EVENTO].min(), "Solapamiento temporal detectado"
+    if train_df.empty or test_df.empty:
+        raise ValueError(
+            "La fecha de corte produce un conjunto vacío."
+        )
+
+    if train_df[FECHA_EVENTO].max() > limite_train:
+        raise ValueError(
+            "Existen etiquetas de entrenamiento sin madurar."
+        )
+
+    if train_df[FECHA_EVENTO].max() >= test_df[FECHA_EVENTO].min():
+        raise ValueError(
+            "Existe solapamiento temporal entre train y test."
+        )
 
     X_train = train_df[FEATURES_FINALES].copy()
     y_train = train_df[TARGET].astype(int).copy()
+
     X_test = test_df[FEATURES_FINALES].copy()
     y_test = test_df[TARGET].astype(int).copy()
 
-    return X_train, X_test, y_train, y_test
+    print("=== DIVISIÓN TEMPORAL ===")
+    print(f"Fecha de corte       : {corte_ts.date()}")
+    print(f"Horizonte            : 60 días")
+    print(f"Límite entrenamiento : {limite_train.date()}")
+    print(f"Train                : {len(train_df):,}")
+    print(f"Hold-out             : {len(test_df):,}")
+    print(
+        f"Gap excluido         : "
+        f"{len(datos) - len(train_df) - len(test_df):,}"
+    )
 
+    return X_train, X_test, y_train, y_test
 
 def obtener_datos_divididos(
     ruta: str | Path | None = None,
