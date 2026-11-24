@@ -1,319 +1,337 @@
-"""
-Simulación de producción por lotes y monitoreo de deriva — OralSolutions (PSet 4).
+"""OralSolutions: primera etapa de simulación cronológica en Snowflake.
 
-1. Divide las 826 sesiones de prueba (>= 2025-08-01) ordenadas cronológicamente
-   en 8 lotes sucesivos (L01 a L08), respetando el horizonte de 60 días para
-   evaluar el target real.
-2. Construye dos lotes con deriva inducida y documentada:
-   - L09_deriva_datos: desplaza distribuciones de entrada (dias_desde_inicio_plan,
-     edad_en_atencion y codigo_procedimiento) manteniendo la relación con el target.
-   - L10_deriva_conceptual: mantiene entradas estables (PSI bajo), pero altera la
-     relación entre progreso_plan y abandono_60d para inducir caída de desempeño.
-3. Llama a la API en Docker (POST /predecir) por cada sesión, calcula métricas de
-   sistema, datos, modelo y negocio, evalúa alertas y exporta evidencias a docs/.
+Ejecutar desde la raíz: python -m monitoreo.simular_produccion --lote 1
+No calcula ni consulta etiquetas durante la inferencia. El piloto queda
+esperando_target. No ejecutar en paralelo ni reintentar lotes incompletos
+sin reconciliar las predicciones ya escritas por la API.
 """
-
 from __future__ import annotations
 
-import json
+import argparse
 import os
-import sys
-from pathlib import Path
-from typing import Any
+import time
+import uuid
+from datetime import date, timedelta
 
-import numpy as np
 import pandas as pd
 import requests
-from sklearn.metrics import average_precision_score, confusion_matrix, precision_score, recall_score
+from mlflow.tracking import MlflowClient
 
-BASE_MONITOREO = Path(__file__).resolve().parent
-BASE_PROYECTO = BASE_MONITOREO.parent
-if str(BASE_PROYECTO) not in sys.path:
-    sys.path.insert(0, str(BASE_PROYECTO))
+from src.datos import conectar_snowflake, consultar_dataframe, TABLA_OBT, TABLA_GOLD
+from src.pipeline import FECHA_CORTE, FECHA_EVENTO
 
-from src.pipeline import (
-    FECHA_CORTE,
-    FECHA_EVENTO,
-    FEATURES_CAT,
-    FEATURES_NUM,
-    SEMILLA,
-    TARGET,
-    cargar_datos,
-    construir_features,
-)
-from monitoreo.alertas import UMBRAL_PSI_CRITICO, evaluar_alertas_lote
-from monitoreo.deriva import diagnosticar_deriva, evaluar_deriva_lote
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+SIMULACION_ID = "SIM_2025_V1"
+SNAPSHOT_ID = "SNAP_SIM_2025_V1"
+SCHEMA = "ORALSOLUTIONS_DW.MLOPS"
+PRED = f"{SCHEMA}.PREDICCIONES"
+LOTES = f"{SCHEMA}.LOTES_PRODUCCION"
+HTTP_LOG = f"{SCHEMA}.SOLICITUDES_HTTP"
+SNAP_OBT = f"{SCHEMA}.{SNAPSHOT_ID}_OBT"
+SNAP_GOLD = f"{SCHEMA}.{SNAPSHOT_ID}_GOLD"
+HORIZONTE = 60
+OBSERVACIONES_ESPERADAS = {
+    1: 12,
+    2: 37,
+    3: 53,
+    4: 61,
+    5: 54,
+    6: 68,
+    7: 59,
+    8: 63,
+    9: 67,
+    10: 66,
+    11: 66,
+    12: 76,
+    13: 63,
+    14: 81,
+}
+LOTES_DERIVA = {7, 8}
+ESCENARIO_DERIVA = "incremento_sintetico_cancelaciones_e_inasistencias_1"
 
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
-N_LOTES_SANOS = 8
-
-# Parámetros de negocio definidos en el PSet 3
-COSTO_FN = 120.0
-COSTO_FP = 3.0
-TASA_RESCATE_TP = 0.35
-INGRESO_RESCATE = COSTO_FN * TASA_RESCATE_TP  # $42 USD
-
-COLS_API = [
-    "duracion_estimada_min",
-    "numero_sesion",
-    "sesiones_planificadas",
-    "cancelaciones_previas",
-    "inasistencias_previas",
-    "dias_desde_inicio_plan",
-    "edad_en_atencion",
-    "codigo_procedimiento",
-    "odontologo_key",
-]
-
-
-def calcular_metricas_negocio(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]:
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    costo_errores = float(fn * COSTO_FN + fp * COSTO_FP)
-    balance_neto = float(tp * (INGRESO_RESCATE - COSTO_FP) - fp * COSTO_FP - fn * COSTO_FN)
-    return {
-        "TP": int(tp),
-        "FP": int(fp),
-        "FN": int(fn),
-        "TN": int(tn),
-        "recall": round(float(recall_score(y_true, y_pred, zero_division=0)), 4),
-        "precision": round(float(precision_score(y_true, y_pred, zero_division=0)), 4),
-        "costo_errores_usd": round(costo_errores, 2),
-        "balance_neto_usd": round(balance_neto, 2),
-    }
+COLS_NUM = ["duracion_estimada_min", "numero_sesion", "sesiones_planificadas",
+            "cancelaciones_previas", "inasistencias_previas", "dias_desde_inicio_plan",
+            "edad_en_atencion"]
+COLS_CAT = ["codigo_procedimiento", "odontologo_key"]
 
 
-def construir_lotes_simulacion(df_test: pd.DataFrame) -> list[tuple[str, str, pd.DataFrame]]:
+def ejecutar_sql(conn, sql, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.rowcount
+
+
+def consultar_filas(conn, sql, params=()):
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+
+def preparar_snapshot(conn):
     """
-    Construye 8 lotes cronológicos reales + 1 lote de deriva de datos + 1 lote de deriva conceptual.
-    Cada tupla devuelve: (lote_id, tipo_lote, dataframe_lote).
+    Crea snapshots persistentes de las fuentes de simulación.
+
+    Admite tablas de origen TRANSIENT y permite recuperar
+    la creación parcial de los snapshots iniciales.
     """
-    indices = np.array_split(np.arange(len(df_test)), N_LOTES_SANOS)
-    lotes: list[tuple[str, str, pd.DataFrame]] = []
 
-    for i, idx in enumerate(indices, start=1):
-        sub = df_test.iloc[idx].copy().reset_index(drop=True)
-        lotes.append((f"L{i:02d}", "produccion_real", sub))
+    existentes = consultar_filas(conn, """
+        SELECT TABLE_NAME
+        FROM ORALSOLUTIONS_DW.INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = 'MLOPS'
+          AND TABLE_NAME IN (%s, %s)
+    """, (
+        SNAP_OBT.split(".")[-1],
+        SNAP_GOLD.split(".")[-1],
+    ))
 
-    rng = np.random.default_rng(SEMILLA)
+    nombres = {fila[0] for fila in existentes}
 
-    # Lote 9: Deriva de datos inducida (cambian entradas, se mantiene relación X -> y)
-    lote_datos = lotes[-1][2].copy()
-    lote_datos["dias_desde_inicio_plan"] = (lote_datos["dias_desde_inicio_plan"] + 45).clip(upper=240)
-    lote_datos["edad_en_atencion"] = (lote_datos["edad_en_atencion"] + 18).clip(upper=95)
-    mask_proc = lote_datos["codigo_procedimiento"].isin(["CROWN", "ROOT"]) & (
-        rng.random(len(lote_datos)) < 0.75
-    )
-    lote_datos.loc[mask_proc, "codigo_procedimiento"] = "WHITEN"
-    lote_datos["fecha_realizada"] = lote_datos["fecha_realizada"] + pd.Timedelta(days=14)
-    lote_datos = construir_features(lote_datos)
-    lotes.append(("L09_deriva_datos", "deriva_datos_inducida", lote_datos))
+    nombre_obt = SNAP_OBT.split(".")[-1]
+    nombre_gold = SNAP_GOLD.split(".")[-1]
 
-    # Lote 10: Deriva conceptual inducida (entradas estables, cambia relación X -> y)
-    lote_concepto = lotes[-2][2].copy()
-    lote_concepto["fecha_realizada"] = lote_concepto["fecha_realizada"] + pd.Timedelta(days=28)
-    mask_alto_prog = (lote_concepto["progreso_plan"] >= 0.50) & (rng.random(len(lote_concepto)) < 0.45)
-    mask_bajo_prog = (lote_concepto["progreso_plan"] < 0.50) & (rng.random(len(lote_concepto)) < 0.40)
-    lote_concepto.loc[mask_alto_prog, TARGET] = 1 - lote_concepto.loc[mask_alto_prog, TARGET]
-    lote_concepto.loc[mask_bajo_prog, TARGET] = 1 - lote_concepto.loc[mask_bajo_prog, TARGET]
-    lotes.append(("L10_deriva_conceptual", "deriva_conceptual_inducida", lote_concepto))
+    if nombre_obt not in nombres:
 
-    return lotes
-
-
-def ejecutar_simulacion() -> None:
-    df_completo = construir_features(cargar_datos())
-    corte_ts = pd.Timestamp(FECHA_CORTE)
-    df_train = df_completo[df_completo[FECHA_EVENTO] < corte_ts].copy().reset_index(drop=True)
-    df_test = df_completo[df_completo[FECHA_EVENTO] >= corte_ts].copy().reset_index(drop=True)
-
-    # Verificar que la API esté arriba
-    salud = requests.get(f"{API_URL}/salud", timeout=10).json()
-    modelo_info = requests.get(f"{API_URL}/modelo", timeout=10).json()
-    print(
-        f"[API] Estado={salud['estado']} | Modelo={modelo_info['nombre_modelo']} "
-        f"v{modelo_info['version']} (@{modelo_info['alias']}) | run_id={modelo_info['run_id']}"
-    )
-
-    lotes = construir_lotes_simulacion(df_test)
-    sesion_http = requests.Session()
-
-    todas_predicciones: list[dict[str, Any]] = []
-    resumen_monitoreo: list[dict[str, Any]] = []
-    todas_alertas: list[dict[str, Any]] = []
-    lotes_guardados: list[pd.DataFrame] = []
-
-    for lote_id, tipo_lote, df_lote in lotes:
-        df_lote_tag = df_lote.copy()
-        df_lote_tag["lote_id"] = lote_id
-        df_lote_tag["tipo_lote"] = tipo_lote
-        lotes_guardados.append(df_lote_tag)
-
-        latencias: list[float] = []
-        errores_4xx = 0
-        errores_5xx = 0
-        probs: list[float] = []
-        preds_bin: list[int] = []
-        version_lote = modelo_info["version"]
-
-        fecha_min = pd.Timestamp(df_lote[FECHA_EVENTO].min())
-        fecha_max = pd.Timestamp(df_lote[FECHA_EVENTO].max())
-        # Respetar horizonte de 60 días: fecha en que el target real queda disponible
-        fecha_target_disponible = (fecha_max + pd.Timedelta(days=60)).strftime("%Y-%m-%d")
-
-        for _, row in df_lote.iterrows():
-            payload = {
-                "duracion_estimada_min": int(row["duracion_estimada_min"]),
-                "numero_sesion": int(row["numero_sesion"]),
-                "sesiones_planificadas": int(row["sesiones_planificadas"]),
-                "cancelaciones_previas": int(row["cancelaciones_previas"]),
-                "inasistencias_previas": int(row["inasistencias_previas"]),
-                "dias_desde_inicio_plan": int(row["dias_desde_inicio_plan"]),
-                "edad_en_atencion": int(row["edad_en_atencion"]),
-                "codigo_procedimiento": str(row["codigo_procedimiento"]),
-                "odontologo_key": str(row["odontologo_key"]),
-            }
-
-            resp = sesion_http.post(f"{API_URL}/predecir", json=payload, timeout=15)
-            if 400 <= resp.status_code < 500:
-                errores_4xx += 1
-                continue
-            if resp.status_code >= 500:
-                errores_5xx += 1
-                continue
-
-            body = resp.json()
-            latencias.append(float(body["latencia_ms"]))
-            probs.append(float(body["probabilidad"]))
-            pred_b = 1 if body["decision"] == "contactar" else 0
-            preds_bin.append(pred_b)
-            version_lote = body["version_modelo"]
-
-            todas_predicciones.append(
-                {
-                    "id_prediccion": body["id_prediccion"],
-                    "lote_id": lote_id,
-                    "tipo_lote": tipo_lote,
-                    "fecha_realizada": pd.Timestamp(row[FECHA_EVENTO]).strftime("%Y-%m-%d"),
-                    "fecha_target_disponible": fecha_target_disponible,
-                    "timestamp_prediccion": body["timestamp"],
-                    "entradas_json": json.dumps(payload, ensure_ascii=False),
-                    "probabilidad": body["probabilidad"],
-                    "decision": body["decision"],
-                    "target_real": int(row[TARGET]),
-                    "version_modelo": body["version_modelo"],
-                    "run_id": body["run_id"],
-                    "uso_respaldo": body["uso_respaldo"],
-                    "latencia_ms": body["latencia_ms"],
-                }
-            )
-
-        y_true = df_lote[TARGET].astype(int).to_numpy()
-        y_prob = np.array(probs, dtype=float)
-        y_pred = np.array(preds_bin, dtype=int)
-
-        # Métricas técnicas y de negocio del modelo
-        pr_auc = round(float(average_precision_score(y_true, y_prob)), 5)
-        neg_modelo = calcular_metricas_negocio(y_true, y_pred)
-
-        # Líneas base de negocio para comparación lote por lote
-        pred_regla = ((df_lote["sesiones_planificadas"] - df_lote["numero_sesion"]) == 1).astype(int).to_numpy()
-        neg_regla = calcular_metricas_negocio(y_true, pred_regla)
-        neg_todos = calcular_metricas_negocio(y_true, np.ones(len(y_true), dtype=int))
-        neg_nada = calcular_metricas_negocio(y_true, np.zeros(len(y_true), dtype=int))
-
-        # Deriva de datos y calidad contra entrenamiento (df_train)
-        df_deriva = evaluar_deriva_lote(df_train, df_lote, FEATURES_NUM, FEATURES_CAT)
-        top_deriva = df_deriva.iloc[0]
-        psi_max = float(top_deriva["psi"])
-        feature_psi_max = str(top_deriva["feature"])
-        pct_faltantes_max = float(df_deriva["pct_faltantes"].max())
-        pct_fuera_rango_max = float(df_deriva["pct_fuera_rango"].max())
-        cats_no_vistas_total = int(df_deriva["categorias_no_vistas"].sum())
-
-        # Diagnóstico y alertas
-        diag = diagnosticar_deriva(psi_max=psi_max, pr_auc_lote=pr_auc, umbral_psi=UMBRAL_PSI_CRITICO)
-        tasa_err = (errores_4xx + errores_5xx) / max(len(df_lote), 1)
-        p50_ms = round(float(np.percentile(latencias, 50)), 3) if latencias else 0.0
-        p95_ms = round(float(np.percentile(latencias, 95)), 3) if latencias else 0.0
-
-        alertas_lote = evaluar_alertas_lote(
-            lote_id=lote_id,
-            psi_max=psi_max,
-            feature_psi_max=feature_psi_max,
-            pr_auc_lote=pr_auc,
-            tasa_error_http=tasa_err,
-            latencia_p95_ms=p95_ms,
-            pct_faltantes_max=pct_faltantes_max,
-        )
-        todas_alertas.extend(alertas_lote)
-
-        resumen_monitoreo.append(
-            {
-                "lote_id": lote_id,
-                "tipo_lote": tipo_lote,
-                "fecha_inicio": fecha_min.strftime("%Y-%m-%d"),
-                "fecha_fin": fecha_max.strftime("%Y-%m-%d"),
-                "fecha_target_disponible": fecha_target_disponible,
-                "n_sesiones": len(df_lote),
-                "version_modelo": version_lote,
-                "latencia_p50_ms": p50_ms,
-                "latencia_p95_ms": p95_ms,
-                "errores_4xx": errores_4xx,
-                "errores_5xx": errores_5xx,
-                "tasa_contactar": round(float(y_pred.mean()), 4),
-                "prob_media": round(float(y_prob.mean()), 4),
-                "tasa_abandono_real": round(float(y_true.mean()), 4),
-                "pr_auc": pr_auc,
-                "recall": neg_modelo["recall"],
-                "precision": neg_modelo["precision"],
-                "costo_modelo_usd": neg_modelo["costo_errores_usd"],
-                "balance_modelo_usd": neg_modelo["balance_neto_usd"],
-                "costo_regla_1_sesion_usd": neg_regla["costo_errores_usd"],
-                "balance_regla_1_sesion_usd": neg_regla["balance_neto_usd"],
-                "costo_llamar_todos_usd": neg_todos["costo_errores_usd"],
-                "balance_llamar_todos_usd": neg_todos["balance_neto_usd"],
-                "costo_no_hacer_nada_usd": neg_nada["costo_errores_usd"],
-                "psi_max": round(psi_max, 5),
-                "feature_psi_max": feature_psi_max,
-                "p_valor_top_deriva": float(top_deriva["p_valor"]),
-                "pct_faltantes_max": pct_faltantes_max,
-                "pct_fuera_rango_max": pct_fuera_rango_max,
-                "categorias_no_vistas": cats_no_vistas_total,
-                "diagnostico": diag["diagnostico"],
-                "n_alertas": len(alertas_lote),
-            }
+        ejecutar_sql(
+            conn,
+            f"CREATE TRANSIENT TABLE {SNAP_OBT} CLONE {TABLA_OBT}"
         )
 
-    # Guardar evidencias CSV en docs/ y dataset de lotes para reentrenamiento
-    docs_dir = BASE_PROYECTO / "docs"
-    docs_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[OK] Snapshot OBT creado: {SNAP_OBT}")
 
-    df_preds = pd.DataFrame(todas_predicciones)
-    df_mon = pd.DataFrame(resumen_monitoreo)
-    df_alrt = pd.DataFrame(todas_alertas)
-    df_lotes_all = pd.concat(lotes_guardados, ignore_index=True)
+    else:
+        print(f"[OK] Snapshot OBT existente: {SNAP_OBT}")
 
-    df_preds.to_csv(docs_dir / "predicciones.csv", index=False)
-    df_mon.to_csv(docs_dir / "monitoreo.csv", index=False)
-    df_alrt.to_csv(docs_dir / "alertas.csv", index=False)
-    df_lotes_all.to_csv(BASE_MONITOREO / "lotes_simulados.csv", index=False)
+    if nombre_gold not in nombres:
 
-    print("\n=== RESUMEN DE SIMULACIÓN POR LOTE ===")
-    cols_vista = [
-        "lote_id",
-        "n_sesiones",
-        "pr_auc",
-        "psi_max",
-        "feature_psi_max",
-        "costo_modelo_usd",
-        "diagnostico",
-        "n_alertas",
-    ]
-    print(df_mon[cols_vista].to_string(index=False))
-    print(f"\n[OK] Predicciones guardadas : {len(df_preds)} filas -> docs/predicciones.csv")
-    print(f"[OK] Monitoreo guardado     : {len(df_mon)} lotes -> docs/monitoreo.csv")
-    print(f"[OK] Alertas disparadas     : {len(df_alrt)} alertas -> docs/alertas.csv")
+        ejecutar_sql(
+            conn,
+            f"CREATE TRANSIENT TABLE {SNAP_GOLD} CLONE {TABLA_GOLD}"
+        )
+
+        print(f"[OK] Snapshot Gold creado: {SNAP_GOLD}")
+
+    else:
+        print(f"[OK] Snapshot Gold existente: {SNAP_GOLD}")
+
+    print(f"Snapshot: {SNAPSHOT_ID}")
 
 
-if __name__ == "__main__":
-    ejecutar_simulacion()
+def obtener_lote(conn, numero):
+    corte = date.fromisoformat(FECHA_CORTE)
+    primer_domingo = corte + timedelta(days=(6 - corte.weekday()) % 7)
+    fin = primer_domingo + timedelta(weeks=numero - 1)
+    inicio = corte if numero == 1 else fin - timedelta(days=6)
+    # La fecha de cobertura es un parámetro histórico del experimento,
+    # no una feature. No se leen resultados futuros ni etiquetas aquí.
+    ultima_elegible = date(2025, 11, 1)
+    df = consultar_dataframe(conn, f"""
+        SELECT * FROM {SNAP_OBT}
+        WHERE FECHA_REALIZADA BETWEEN '{inicio.isoformat()}' AND '{min(fin, ultima_elegible).isoformat()}'
+          AND FECHA_REALIZADA >= FECHA_INICIO_PLAN
+        ORDER BY FECHA_REALIZADA, SESION_KEY
+    """)
+    if df.empty or df['sesion_key'].isna().any() or not df['sesion_key'].is_unique:
+        raise RuntimeError("Lote vacío o sesiones inválidas.")
+    df[FECHA_EVENTO] = pd.to_datetime(df[FECHA_EVENTO])
+    if df[COLS_NUM + COLS_CAT + ['paciente_key', 'plan_tratamiento_id']].isna().any().any():
+        raise RuntimeError("El lote contiene entradas o identificadores nulos.")
+    esperado = OBSERVACIONES_ESPERADAS[numero]
+    if len(df) != esperado:
+        raise RuntimeError(
+            f"L{numero:02d}: se esperaban {esperado} "
+            f"observaciones, llegaron {len(df)}."
+        )
+
+    return inicio, fin, df
+
+
+def payload_api(fila, numero=1):
+    payload = {c: int(fila[c]) for c in COLS_NUM}
+    payload.update({c: str(fila[c]) for c in COLS_CAT})
+    if numero in LOTES_DERIVA:
+        for campo in ("cancelaciones_previas", "inasistencias_previas"):
+            payload[campo] = min(50, payload[campo] + 1)
+    return payload
+
+
+def modelo_activo(http):
+    respuesta = http.get(f"{API_URL}/modelo", timeout=120)
+    respuesta.raise_for_status()
+    info = respuesta.json()
+    if info['modo_respaldo'] or info['alias'] != 'champion':
+        raise RuntimeError("No está activo el champion ML.")
+    cliente = MlflowClient(tracking_uri=TRACKING_URI)
+    version = cliente.get_model_version_by_alias(info['nombre_modelo'], 'champion')
+    if str(version.version) != str(info['version']) or version.run_id != info['run_id']:
+        raise RuntimeError("La API y MLflow no coinciden.")
+    info['hash_dataset'] = cliente.get_run(info['run_id']).data.params['hash_dataset']
+    return info
+
+
+def solicitar_prediccion(conn, http, lote_id, sesion, fecha, payload):
+    """Registra cada intento POST, incluso errores HTTP y de transporte.
+
+    No reintenta solicitudes: un timeout puede haber generado una predicción.
+    La latencia se mide hasta recibir la respuesta, antes de escribir telemetría.
+    """
+    solicitud = str(uuid.uuid4())
+    inicio = time.perf_counter()
+    respuesta = None
+    error_transporte = False
+    try:
+        respuesta = http.post(f"{API_URL}/predecir", json=payload, timeout=120)
+    except requests.RequestException:
+        error_transporte = True
+        raise
+    finally:
+        latencia = (time.perf_counter() - inicio) * 1000
+        codigo = respuesta.status_code if respuesta is not None else None
+        prediccion = None
+        if codigo == 200:
+            try:
+                prediccion = respuesta.json().get('id_prediccion')
+            except (ValueError, AttributeError):
+                pass
+        ejecutar_sql(conn, f"""
+            INSERT INTO {HTTP_LOG} (ID_SOLICITUD, SIMULACION_ID, LOTE_ID,
+                SESION_KEY, FECHA_SIMULADA, CODIGO_HTTP, LATENCIA_HTTP_MS,
+                ERROR_TRANSPORTE, ID_PREDICCION)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (solicitud, SIMULACION_ID, lote_id, sesion, fecha, codigo,
+              latencia, error_transporte, prediccion))
+    respuesta.raise_for_status()
+    return respuesta.json()
+
+
+def ejecutar_lote(numero=1):
+    if numero not in OBSERVACIONES_ESPERADAS:
+        raise ValueError(
+            "El número de lote debe estar entre 1 y 14."
+        )
+    lote_id = f"L{numero:02d}"
+    conn = conectar_snowflake()
+    conn.autocommit(True)
+    try:
+        previos = consultar_filas(conn, f"""
+            SELECT ESTADO, TOTAL_OBSERVACIONES FROM {LOTES}
+            WHERE SIMULACION_ID=%s AND LOTE_ID=%s
+        """, (SIMULACION_ID, lote_id))
+        if previos:
+            estado, esperado = previos[0]
+            if len(previos) == 1 and estado in ('esperando_target', 'evaluado'):
+                conteos = consultar_filas(conn, f"""
+                    SELECT COUNT(*), COUNT(DISTINCT SESION_KEY) FROM {PRED}
+                    WHERE SIMULACION_ID=%s AND LOTE_ID=%s AND ORIGEN='simulacion'
+                """, (SIMULACION_ID, lote_id))[0]
+                if tuple(conteos) == (esperado, esperado):
+                    print(f"[OK] {lote_id} ya procesado; no se repiten predicciones.")
+                    return
+            raise RuntimeError("Lote previo incompleto o inconsistente. Reconciliar antes de reintentar.")
+
+        preparar_snapshot(conn)
+        inicio, fin, df = obtener_lote(conn, numero)
+        maduracion = fin + timedelta(days=HORIZONTE)
+        deriva = numero in LOTES_DERIVA
+        escenario = ESCENARIO_DERIVA if deriva else "sin_deriva"
+        with requests.Session() as http:
+            info = modelo_activo(http)
+            print(f"{lote_id}: {inicio} a {fin} | {len(df)} observaciones")
+            print(f"Champion v{info['version']} | run_id={info['run_id']}")
+            print(f"Escenario: {escenario}")
+            print(f"Fecha virtual: {fin} | Evaluación completa desde: {maduracion}")
+            ejecutar_sql(conn, f"""
+                INSERT INTO {LOTES} (SIMULACION_ID, LOTE_ID, NUMERO_LOTE,
+                    FECHA_INICIO, FECHA_FIN, FECHA_PROCESAMIENTO_SIMULADA,
+                    FECHA_MADURACION, TOTAL_OBSERVACIONES, ESTADO,
+                    VERSION_MODELO, RUN_ID, HASH_DATASET, SNAPSHOT_ID,
+                    DERIVA_INDUCIDA, ESCENARIO_DERIVA)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'procesando',%s,%s,%s,%s,%s,%s)
+            """, (SIMULACION_ID, lote_id, numero, inicio, fin, fin, maduracion,
+                  len(df), str(info['version']), info['run_id'], info['hash_dataset'], SNAPSHOT_ID, deriva, escenario))
+            try:
+                for i, (_, fila) in enumerate(df.iterrows(), 1):
+                    payload = payload_api(fila, numero)
+                    # No se reintenta POST automáticamente: la API asigna UUID.
+                    r = solicitar_prediccion(conn, http, lote_id, int(fila['sesion_key']), fin, payload)
+                    if (r['uso_respaldo'] or str(r['version_modelo']) != str(info['version'])
+                            or r['run_id'] != info['run_id']):
+                        raise RuntimeError(f"Modelo inesperado en predicción {r['id_prediccion']}.")
+                    referencia = fila[FECHA_EVENTO].date()
+                    # La API ya insertó la fila. Se enriquece por UUID, no se duplica.
+                    n = ejecutar_sql(conn, f"""
+                        UPDATE {PRED} SET ORIGEN='simulacion', SIMULACION_ID=%s,
+                            LOTE_ID=%s, SESION_KEY=%s, PACIENTE_KEY=%s,
+                            PLAN_TRATAMIENTO_ID=%s, FECHA_REFERENCIA=%s,
+                            FECHA_MADURACION=%s, FECHA_SIMULADA=%s,
+                            UMBRAL_APLICADO=%s, ACCION=%s, HASH_DATASET=%s,
+                            SNAPSHOT_ID=%s, DERIVA_INDUCIDA=%s
+                        WHERE ID_PREDICCION=%s AND ORIGEN IS NULL
+                          AND VERSION_MODELO=%s AND RUN_ID=%s
+                    """, (SIMULACION_ID, lote_id, int(fila['sesion_key']), int(fila['paciente_key']),
+                          int(fila['plan_tratamiento_id']), referencia, referencia+timedelta(days=HORIZONTE),
+                          fin, float(r['umbral_aplicado']), r['accion'], info['hash_dataset'],
+                          SNAPSHOT_ID, deriva, r['id_prediccion'], str(info['version']), info['run_id']))
+                    if n != 1:
+                        raise RuntimeError(f"Se esperaba actualizar 1 fila para {r['id_prediccion']}; resultado={n}.")
+                    print(f"  [{i:02d}/{len(df)}] sesión={int(fila['sesion_key'])} | id={r['id_prediccion']} | {r['decision']}")
+                total, unicas = consultar_filas(conn, f"""
+                    SELECT COUNT(*), COUNT(DISTINCT SESION_KEY) FROM {PRED}
+                    WHERE SIMULACION_ID=%s AND LOTE_ID=%s AND ORIGEN='simulacion'
+                """, (SIMULACION_ID, lote_id))[0]
+                if (total, unicas) != (len(df), len(df)):
+                    raise RuntimeError("El conteo de predicciones no coincide con el lote.")
+                ejecutar_sql(conn, f"""
+                    UPDATE {LOTES} SET ESTADO='esperando_target', TOTAL_PREDICCIONES=%s,
+                        TOTAL_ERRORES=0 WHERE SIMULACION_ID=%s AND LOTE_ID=%s
+                """, (total, SIMULACION_ID, lote_id))
+            except Exception:
+                total = consultar_filas(conn, f"""
+                    SELECT COUNT(*) FROM {PRED} WHERE SIMULACION_ID=%s AND LOTE_ID=%s
+                """, (SIMULACION_ID, lote_id))[0][0]
+                ejecutar_sql(conn, f"""
+                    UPDATE {LOTES} SET ESTADO='error', TOTAL_PREDICCIONES=%s,
+                        TOTAL_ERRORES=1 WHERE SIMULACION_ID=%s AND LOTE_ID=%s
+                """, (total, SIMULACION_ID, lote_id))
+                raise
+        print(f"[OK] {lote_id}: {total} predicciones persistidas y asociadas.")
+        print("Estado: esperando_target. No se han calculado métricas supervisadas.")
+    finally:
+        conn.close()
+
+
+def verificar_lotes():
+    """Verificación de solo lectura: no genera predicciones ni modifica tablas."""
+    from api.esquemas import SolicitudPrediccion
+
+    conn = conectar_snowflake()
+    try:
+        total = 0
+        sesiones = set()
+        for numero in OBSERVACIONES_ESPERADAS:
+            inicio, fin, df = obtener_lote(conn, numero)
+            claves = set(df["sesion_key"].astype(int))
+            if sesiones.intersection(claves):
+                raise RuntimeError("Sesiones repetidas entre lotes.")
+            sesiones.update(claves)
+            for _, fila in df.iterrows():
+                SolicitudPrediccion.model_validate(payload_api(fila, numero))
+            total += len(df)
+            print(f"[OK] L{numero:02d}: {inicio} a {fin} | {len(df)} entradas validas | deriva={numero in LOTES_DERIVA}")
+        if total != 826 or len(sesiones) != 826:
+            raise RuntimeError("Conteo global inesperado.")
+        print(f"[OK] {total} entradas validas y sesiones unicas. No se generaron predicciones.")
+    finally:
+        conn.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--lote', type=int, default=1)
+    parser.add_argument('--verificar', action='store_true')
+    args = parser.parse_args()
+    if args.verificar:
+        verificar_lotes()
+    else:
+        ejecutar_lote(args.lote)

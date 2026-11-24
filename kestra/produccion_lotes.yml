@@ -1,34 +1,58 @@
 id: produccion_lotes
 namespace: oralsolutions.mlops
-description: "Inferencia batch nocturna contra la API @champion (02:00 America/Guayaquil)."
 
-triggers:
-  - id: horario_nocturno_batch
-    type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 2 * * *"
-    timezone: America/Guayaquil
+description: >
+  Procesamiento de un lote semanal de producción simulada,
+  utilizando el champion activo y persistiendo resultados en Snowflake.
+
+inputs:
+  - id: lote
+    type: INT
+    required: true
+    defaults: 3
+    min: 1
+    max: 14
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
 
 tasks:
   - id: verificar_salud_api
     type: io.kestra.plugin.core.http.Request
-    uri: "http://api:8000/salud"
+    uri: http://api:8000/salud
     method: GET
 
-  - id: ejecutar_inferencia_lotes
+  - id: ejecutar_inferencia_lote
     type: io.kestra.plugin.scripts.python.Commands
+
+    containerImage: python:3.14-slim
+
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
-      networkMode: pset_2_default
-    containerImage: python:3.14-slim
-    env:
-      API_URL: "http://api:8000"
-    beforeCommands:
-      - pip install -q pandas numpy requests scikit-learn scipy
-    commands:
-      - python monitoreo/simular_produccion.py
+      networkMode: proyecto_final_default
+      volumes:
+        - "{{ envs.kestra_host_project_path }}:/proyecto:ro"
 
-  - id: disparar_monitoreo
+    env:
+      API_URL: http://api:8000
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+
+    beforeCommands:
+      - pip install -q -r /proyecto/api/requirements.txt
+      - pip install -q python-dotenv==1.2.1
+
+    commands:
+      - cd /proyecto
+      - python -m monitoreo.simular_produccion --lote {{ inputs.lote }}
+
+  - id: ejecutar_monitoreo
     type: io.kestra.plugin.core.flow.Subflow
     namespace: oralsolutions.mlops
     flowId: monitoreo
     wait: true
+    transmitFailed: true
+    inputs:
+      lote: "{{ inputs.lote }}"

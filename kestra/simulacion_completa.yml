@@ -1,0 +1,63 @@
+id: simulacion_completa
+namespace: oralsolutions.mlops
+
+description: >
+  Ejecuta secuencialmente los lotes pendientes de producción
+  simulada y avanza el reloj virtual hasta completar
+  la maduración de todos los targets.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+  - id: procesar_lotes
+    type: io.kestra.plugin.core.flow.Loop
+
+    values: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+
+    concurrencyLimit: 1
+
+    tasks:
+      - id: ejecutar_lote
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: oralsolutions.mlops
+        flowId: produccion_lotes
+        wait: true
+        transmitFailed: true
+        inputs:
+          lote: "{{ item.value }}"
+
+  - id: completar_maduracion
+    type: io.kestra.plugin.core.flow.Loop
+
+    values:
+      - "2025-11-06"
+      - "2025-11-13"
+      - "2025-11-20"
+      - "2025-11-27"
+      - "2025-12-04"
+      - "2025-12-11"
+      - "2025-12-18"
+      - "2025-12-25"
+      - "2026-01-01"
+
+    concurrencyLimit: 1
+
+    tasks:
+      - id: avanzar_reloj_virtual
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: oralsolutions.mlops
+        flowId: monitoreo
+        wait: true
+        transmitFailed: true
+        inputs:
+          lote: 0
+          fecha_virtual: "{{ item.value }}"
+
+  - id: finalizar_simulacion
+    type: io.kestra.plugin.core.log.Log
+    message: >
+      Simulación de producción finalizada.
+      Procesamiento de lotes y avance del reloj virtual completados.
+      Verificar resultados consolidados en Snowflake.
