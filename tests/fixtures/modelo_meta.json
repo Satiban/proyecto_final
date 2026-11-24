@@ -3,5 +3,30 @@
   "alias": "champion",
   "version": "1",
   "run_id": "c90a1c37aef940278afc025b1d22dc6b",
-  "umbral_decision": 0.01
+  "umbral_decision": 0.01,
+  "fecha_corte": "2025-08-01",
+  "horizonte_dias": 60,
+  "hash_dataset": "11ae3cc53264511ef486f12d7a3fc0ddf2c6311e3ae7a8076f3c0cf046396dc1",
+  "pr_auc_test": 0.15985783748710125,
+  "pr_auc_cv_mean": 0.18522254921481657,
+  "pr_auc_cv_std": 0.05966934121023218,
+  "tolerancia_pr_auc": 0.0005,
+  "n_observaciones_test": 826,
+  "costo_fn": 120.0,
+  "costo_fp": 3.0,
+  "features": [
+    "duracion_estimada_min",
+    "numero_sesion",
+    "sesiones_planificadas",
+    "cancelaciones_previas",
+    "inasistencias_previas",
+    "dias_desde_inicio_plan",
+    "edad_en_atencion",
+    "progreso_plan",
+    "ritmo_dias_por_sesion",
+    "friccion_previa",
+    "codigo_procedimiento",
+    "odontologo_key",
+    "complejidad_proc"
+  ]
 }

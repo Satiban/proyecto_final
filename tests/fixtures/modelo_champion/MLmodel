@@ -12,8 +12,29 @@ flavors:
     pickled_model: model.pkl
     serialization_format: cloudpickle
     sklearn_version: 1.9.1
+is_signature_from_type_hint: false
 mlflow_version: 2.22.5
-model_size_bytes: 143856
-model_uuid: 12e0ff4e5887464aacfefd4ef8f9ab20
+model_size_bytes: 145542
+model_uuid: 6634d0c6eea24c25836c649f70aad2f0
 prompts: null
-utc_time_created: '2026-11-24 02:26:30.668028'
+saved_input_example_info:
+  artifact_path: input_example.json
+  pandas_orient: split
+  serving_input_path: serving_input_example.json
+  type: dataframe
+signature:
+  inputs: '[{"type": "long", "name": "duracion_estimada_min", "required": true}, {"type":
+    "long", "name": "numero_sesion", "required": true}, {"type": "long", "name": "sesiones_planificadas",
+    "required": true}, {"type": "long", "name": "cancelaciones_previas", "required":
+    true}, {"type": "long", "name": "inasistencias_previas", "required": true}, {"type":
+    "long", "name": "dias_desde_inicio_plan", "required": true}, {"type": "long",
+    "name": "edad_en_atencion", "required": true}, {"type": "double", "name": "progreso_plan",
+    "required": true}, {"type": "double", "name": "ritmo_dias_por_sesion", "required":
+    true}, {"type": "long", "name": "friccion_previa", "required": true}, {"type":
+    "string", "name": "codigo_procedimiento", "required": true}, {"type": "string",
+    "name": "odontologo_key", "required": true}, {"type": "string", "name": "complejidad_proc",
+    "required": true}]'
+  outputs: '[{"type": "tensor", "tensor-spec": {"dtype": "int64", "shape": [-1]}}]'
+  params: null
+type_hint_from_example: false
+utc_time_created: '2026-11-24 04:00:32.661302'
