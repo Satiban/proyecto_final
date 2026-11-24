@@ -174,18 +174,25 @@ def test_fallback_cuando_modelo_no_carga(
 
 def test_interruptor_respaldo_protegido(
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Comprueba la autenticación del interruptor administrativo
-    y su efecto sobre las predicciones.
+    Comprueba la autenticación del interruptor
+    administrativo y su efecto sobre las predicciones.
     """
 
-    # Intento sin token válido
+    monkeypatch.setattr(
+        api,
+        "ADMIN_TOKEN",
+        "token-exclusivo-de-pruebas",
+    )
+
+    # 1. Intento con token incorrecto.
     respuesta_no_auth = client.post(
         "/admin/respaldo",
         json={
             "activar": True,
-            "motivo": "Prueba sin token",
+            "motivo": "Prueba sin token válido",
         },
         headers={
             "x-admin-token": "token-invalido",
@@ -194,7 +201,7 @@ def test_interruptor_respaldo_protegido(
 
     assert respuesta_no_auth.status_code == 401
 
-    # Activación con token administrativo
+    # 2. Activación con token válido.
     respuesta_ok = client.post(
         "/admin/respaldo",
         json={
@@ -209,7 +216,7 @@ def test_interruptor_respaldo_protegido(
     assert respuesta_ok.status_code == 200
     assert respuesta_ok.json()["modo_respaldo"] is True
 
-    # Comprobar que la API utiliza el respaldo
+    # 3. Comprobar que utiliza el respaldo.
     respuesta = client.post(
         "/predecir",
         json=PAYLOAD_VALIDO,
@@ -217,3 +224,102 @@ def test_interruptor_respaldo_protegido(
 
     assert respuesta.status_code == 200
     assert respuesta.json()["uso_respaldo"] is True
+
+
+@pytest.mark.parametrize(
+    "numero_sesion,sesiones_planificadas,decision_esperada,score_esperado",
+    [
+        (2, 3, "contactar", 0.99),
+        (1, 3, "no_contactar", 0.13),
+        (1, 4, "no_contactar", 0.13),
+    ],
+)
+def test_respaldo_respeta_regla_negocio(
+    client: TestClient,
+    numero_sesion: int,
+    sesiones_planificadas: int,
+    decision_esperada: str,
+    score_esperado: float,
+) -> None:
+    """El respaldo debe respetar la regla de una sesión restante."""
+
+    api.estado.modo_respaldo = True
+
+    payload = {
+        **PAYLOAD_VALIDO,
+        "numero_sesion": numero_sesion,
+        "sesiones_planificadas": sesiones_planificadas,
+    }
+
+    respuesta = client.post(
+        "/predecir",
+        json=payload,
+    )
+
+    assert respuesta.status_code == 200
+
+    body = respuesta.json()
+
+    assert body["uso_respaldo"] is True
+    assert body["version_modelo"] == "fallback-regla-1-sesion"
+
+    assert body["probabilidad"] == pytest.approx(
+        score_esperado
+    )
+
+    assert body["umbral_aplicado"] == pytest.approx(0.5)
+
+    assert body["decision"] == decision_esperada
+
+
+def test_interruptor_sin_token_configurado(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El endpoint administrativo debe estar protegido."""
+
+    monkeypatch.setattr(api, "ADMIN_TOKEN", "")
+
+    respuesta = client.post(
+        "/admin/respaldo",
+        json={
+            "activar": True,
+            "motivo": "Prueba sin configuración",
+        },
+    )
+
+    assert respuesta.status_code == 503
+    assert api.estado.modo_respaldo is False
+
+
+def test_modelo_utiliza_umbral_version_activa(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """La inferencia debe usar el umbral del modelo activo."""
+
+    monkeypatch.setattr(
+        api.estado,
+        "umbral_decision",
+        0.75,
+    )
+
+    respuesta = client.post(
+        "/predecir",
+        json=PAYLOAD_VALIDO,
+    )
+
+    assert respuesta.status_code == 200
+
+    body = respuesta.json()
+
+    assert body["uso_respaldo"] is False
+    assert body["umbral_aplicado"] == pytest.approx(0.75)
+
+    decision_esperada = (
+        "contactar"
+        if body["probabilidad"] >= 0.75
+        else "no_contactar"
+    )
+
+    assert body["decision"] == decision_esperada

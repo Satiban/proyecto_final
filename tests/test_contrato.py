@@ -152,3 +152,95 @@ def test_contrato_regla_sesiones_invalida_devuelve_422(
     resp = client.post("/predecir", json=sin_pendientes)
 
     assert resp.status_code == 422
+
+
+def test_contrato_tipo_estricto_devuelve_422(
+    client: TestClient,
+) -> None:
+    """Una cadena numérica no debe aceptarse como entero."""
+
+    payload = {
+        **PAYLOAD_VALIDO,
+        "duracion_estimada_min": "75",
+    }
+
+    resp = client.post("/predecir", json=payload)
+
+    assert resp.status_code == 422
+    assert "duracion_estimada_min" in resp.text
+
+
+@pytest.mark.parametrize(
+    "campo,valor",
+    [
+        ("duracion_estimada_min", -10),
+        ("numero_sesion", 0),
+        ("sesiones_planificadas", 1),
+        ("cancelaciones_previas", -1),
+        ("inasistencias_previas", -1),
+        ("dias_desde_inicio_plan", -5),
+        ("edad_en_atencion", 150),
+    ],
+)
+def test_contrato_valor_fuera_rango_devuelve_422(
+    client: TestClient,
+    campo: str,
+    valor: int,
+) -> None:
+    """Los valores fuera de los rangos válidos se rechazan."""
+
+    payload = {
+        **PAYLOAD_VALIDO,
+        campo: valor,
+    }
+
+    resp = client.post("/predecir", json=payload)
+
+    assert resp.status_code == 422
+    assert campo in resp.text
+
+
+@pytest.mark.parametrize(
+    "campo,valor",
+    [
+        ("duracion_estimada_min", -10),
+        ("numero_sesion", 0),
+        ("sesiones_planificadas", 1),
+        ("cancelaciones_previas", -1),
+        ("inasistencias_previas", -1),
+        ("dias_desde_inicio_plan", -5),
+        ("edad_en_atencion", 150),
+    ],
+)
+def test_contrato_valor_fuera_rango_devuelve_422(
+    client: TestClient,
+    campo: str,
+    valor: int,
+) -> None:
+    """Los valores fuera de los rangos válidos se rechazan."""
+
+    payload = {
+        **PAYLOAD_VALIDO,
+        campo: valor,
+    }
+
+    resp = client.post("/predecir", json=payload)
+
+    assert resp.status_code == 422
+    assert campo in resp.text
+
+
+def test_contrato_campo_extra_devuelve_422(
+    client: TestClient,
+) -> None:
+    """La API no debe aceptar el target como entrada."""
+
+    payload = {
+        **PAYLOAD_VALIDO,
+        "abandono_60d": 1,
+    }
+
+    resp = client.post("/predecir", json=payload)
+
+    assert resp.status_code == 422
+    assert "abandono_60d" in resp.text
