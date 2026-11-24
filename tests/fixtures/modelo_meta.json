@@ -1,6 +1,7 @@
 {
   "nombre_modelo": "oralsolutions-modelo",
   "alias": "champion",
-  "version": "7",
-  "run_id": "169e8821e2c54761bf602b21f86aec93"
+  "version": "1",
+  "run_id": "c90a1c37aef940278afc025b1d22dc6b",
+  "umbral_decision": 0.01
 }
