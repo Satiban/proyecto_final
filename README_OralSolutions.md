@@ -61,29 +61,31 @@ La estructura **actual** utiliza la raíz `proyecto_final/`, sin las carpetas an
 ```text
 proyecto_final/
 ├── README.md
-├── docker-compose.yml             # Servicios Docker del proyecto
-├── Dockerfile.dbt                 # Imagen de dbt con adaptador Snowflake
-├── requirements.txt              # Dependencias Python locales
-├── .env.example                  # Plantilla pública de variables
-├── .env                          # Credenciales locales: NO versionar
+├── docker-compose.yml
+├── Dockerfile.dbt
+├── requirements.txt
+├── .env.example
+├── .env                         # Credenciales privadas; no versionar
 ├── .gitignore
+├── .github/
+│   └── workflows/              # Integración y despliegue continuo
 ├── config/
 │   └── dbt/
 │       ├── profiles.example.yml
-│       └── profiles.yml          # Perfil privado de Snowflake: NO versionar
+│       └── profiles.yml        # Configuración privada
 ├── data/
-│   └── raw/                      # 11 CSV, excluidos de Git
+│   ├── raw/                    # 11 archivos CSV de origen
+│   └── processed/              # Dataset preparado para modelado
 ├── dbt/
 │   ├── dbt_project.yml
 │   ├── models/
-│   │   ├── bronze/               # 11 modelos y _sources.yml
-│   │   ├── silver/               # 11 modelos y _silver.yml
-│   │   └── gold/                 # 6 modelos y schema.yml
+│   │   ├── bronze/
+│   │   ├── silver/
+│   │   └── gold/
 │   ├── macros/
-│   │   └── generate_schema_name.sql
-│   └── tests/                    # Pruebas SQL, si corresponden
+│   └── tests/
 ├── kestra/
-│   ├── ingesta.yml               # Flujo maestro; id interno: flow_proyecto
+│   ├── ingesta.yml
 │   ├── ingest_raw_oralsolutions.yml
 │   ├── backfill_oralsolutions.yml
 │   ├── test_dbt_docker.yml
@@ -99,10 +101,32 @@ proyecto_final/
 │   ├── datos.py
 │   ├── pipeline.py
 │   └── reentrenar.py
-└── docs/                        # Documentación y evidencias
+├── notebooks/
+│   ├── 01_eda.ipynb
+│   ├── 02_features.ipynb
+│   ├── 03_baseline_candidatos.ipynb
+│   ├── 04_tuning.ipynb
+│   └── 05_seleccion.ipynb
+├── api/
+│   └── main.py
+├── tests/
+│   ├── test_pipeline.py
+│   ├── test_modelo.py
+│   ├── test_contrato.py
+│   ├── test_comportamiento.py
+│   └── fixtures/
+│       ├── muestra_test.csv
+│       ├── modelo_meta.json
+│       └── modelo_champion/
+├── calidad/
+│   └── diagnostico_proyecto.ipynb
+└── docs/
+    ├── cambios.md
+    ├── resultados_modelos.csv
+    ├── resultados_tuning.csv
+    ├── resultados_seleccion.csv
+    └── corridas.csv
 ```
-
-> El árbol muestra los archivos y directorios relevantes para reproducir el **pipeline de datos**. La aplicación del PSet4 puede incluir, además, otros módulos, servicios, notebooks, pruebas y artefactos que deben documentarse en las secciones correspondientes. El archivo **`kestra/ingesta.yml` no se renombra**: su identificador dentro de Kestra es `oralsolutions.flow_proyecto`.
 
 ### 2. Requisitos previos y entorno Python
 
@@ -271,3 +295,190 @@ Para el dataset utilizado, se esperan **3.435 registros**, **3.435 sesiones úni
 ### Decisión de procesamiento: Batch vs. Streaming
 
 Se seleccionó **procesamiento por lotes (batch) diario**, con horario propuesto de **02:00 en `America/Guayaquil`**, porque el objetivo de negocio consiste en priorizar contactos, recordatorios y reprogramaciones ante el posible abandono durante un horizonte de 60 días. La decisión no requiere una respuesta de milisegundos ni una infraestructura de streaming continuo. Consolidar los registros durante la madrugada facilita que el personal disponga de información actualizada al comenzar la jornada, con una complejidad operativa menor.
+
+
+
+## Cómo entrenar y evaluar el modelo
+
+Todos los comandos se ejecutan desde la raíz de `proyecto_final/`, con el entorno virtual activado. Esta etapa utiliza la OBT generada durante el PSet 2 y los componentes de modelado del PSet 3.
+
+### 1. Extracción desde Snowflake y generación del dataset (`src/datos.py`)
+
+El modelado parte de `ORALSOLUTIONS_DW.OBT.OBT_RIESGO_ABANDONO`, con **3.435 sesiones candidatas**, y consulta adicionalmente `GOLD.FACT_SESIONES_TRATAMIENTO` para identificar la continuidad real de cada tratamiento.
+
+El script utiliza las credenciales Snowflake de `.env`, identifica sesiones completadas posteriores dentro del mismo tratamiento y construye el target `abandono_60d`:
+
+- **0 (continuidad):** existe una sesión posterior completada dentro de 60 días.
+- **1 (abandono):** no existe continuidad registrada dentro de 60 días.
+
+Se excluyen las observaciones de los últimos 60 días del histórico (1.058 registros) para evitar censura a la derecha, así como las fechas inconsistentes. Las columnas auxiliares futuras se eliminan antes de guardar el dataset.
+
+```powershell
+python -m src.datos
+```
+
+**Resultado verificado:** `data/processed/obt_riesgo_abandono.csv`, con **2.377 observaciones, 21 columnas, 321 abandonos (13,50 %) y 2.056 continuidades (86,50 %)**.
+
+Huella del dataset:
+
+```text
+SHA-256:
+11ae3cc53264511ef486f12d7a3fc0ddf2c6311e3ae7a8076f3c0cf046396dc1
+```
+
+El script guarda directamente el CSV y calcula su huella SHA-256, sin generar respaldos automáticos. Si se modifica el dataset, deberán repetirse los experimentos y actualizarse las evidencias.
+
+### 2. Preparación y división temporal (`src/pipeline.py`)
+
+El pipeline carga el CSV, ordena las observaciones por `(fecha_realizada, sesion_key)` y aplica una división temporal con `FECHA_CORTE = 2025-08-01` y horizonte de maduración de 60 días.
+
+| Conjunto | Período | Observaciones | Abandono |
+|---|---|---:|---:|
+| Entrenamiento | Hasta 2025-06-02 | 1.195 | 13,64 % |
+| Gap excluido | 2025-06-03 a 2025-07-31 | 356 | 11,24 % |
+| Hold-out | Desde 2025-08-01 | 826 | 14,29 % |
+
+La separación temporal evita utilizar etiquetas que aún no habrían madurado al comenzar el período de evaluación.
+
+Se construyen cuatro características derivadas:
+
+- `progreso_plan`: `numero_sesion / sesiones_planificadas`.
+- `ritmo_dias_por_sesion`: `dias_desde_inicio_plan / numero_sesion`.
+- `friccion_previa`: cancelaciones e inasistencias acumuladas.
+- `complejidad_proc`: agrupación del procedimiento odontológico.
+
+El modelo utiliza **13 predictores** (10 numéricos y 3 categóricos). Un `ColumnTransformer` integrado en un `Pipeline` aplica imputación por mediana y `RobustScaler` a numéricas, y moda más `OneHotEncoder` a categóricas, produciendo **23 columnas transformadas**. El preprocesador se ajusta exclusivamente con datos de entrenamiento.
+
+Verificar independientemente:
+
+```powershell
+python -m src.pipeline
+```
+
+**Resultado verificado:** 1.195 observaciones de entrenamiento, 826 de hold-out, 356 excluidas y matrices transformadas de `(1195, 23)` y `(826, 23)`.
+
+### 3. Levantar MLflow
+
+La experimentación utiliza MLflow 2.19.0 mediante Docker Compose, con almacenamiento persistente en el volumen `proyecto_final_datos_mlflow`.
+
+Desde `proyecto_final/`:
+
+```powershell
+docker compose -p proyecto_final up -d mlflow
+
+docker compose -p proyecto_final ps mlflow
+
+docker compose -p proyecto_final logs --tail=30 mlflow
+```
+
+Interfaz web: **http://localhost:5000**
+
+Los notebooks utilizan el experimento `OralSolutions` y registran parámetros, métricas, etiquetas, artefactos y modelos. No es necesario eliminar las corridas anteriores para consultar o reutilizar los modelos existentes.
+
+### 4. Orden de ejecución de los notebooks (`notebooks/`)
+
+Seleccionar el kernel del entorno virtual `.venv` y ejecutar los notebooks en el siguiente orden. Todos reutilizan `src/pipeline.py`.
+
+1. **`01_eda.ipynb` — Análisis exploratorio:** distribución de clases, calidad del dataset, recurrencia de pacientes, valores atípicos, correlaciones de Spearman y hallazgos relevantes para el modelado.
+
+2. **`02_features.ipynb` — Ingeniería y evaluación de características:** analiza las cuatro variables derivadas mediante estadísticas descriptivas, correlaciones y pruebas de asociación. Incluye un estudio de ablación con LogisticRegression y cinco pliegues temporales purgados, comparando nueve variables originales frente a trece variables completas y cuatro configuraciones de eliminación individual. El modelo original obtuvo PR-AUC de 0,16795 frente a 0,16683 del modelo completo (diferencia de −0,00112), con mejoras en solo uno de cinco pliegues. No se demostró un aporte predictivo incremental conjunto de las variables derivadas para este algoritmo. La evaluación no utiliza el hold-out ni modifica MLflow.
+
+3. **`03_baseline_candidatos.ipynb` — Líneas base y modelos candidatos:** compara tres líneas base (Dummy Mayoritaria, Regla de Negocio 14d y Regla 1 Sesión) y cinco candidatos (LogisticRegression, RandomForest, HistGradientBoosting, MLPClassifier y GaussianNB), mediante validación temporal purgada de cinco pliegues. Exporta `docs/resultados_modelos.csv`. Incluye una comparación exploratoria con un LLM local.
+
+4. **`04_tuning.ipynb` — Optimización de hiperparámetros:** ejecuta `RandomizedSearchCV` sobre MLPClassifier, HistGradientBoosting y LogisticRegression, con 30 configuraciones por familia, cinco pliegues temporales purgados y semilla 42. Registra 93 corridas de tuning en MLflow y exporta `docs/resultados_tuning.csv`.
+
+5. **`05_seleccion.ipynb` — Selección y evaluación final:** compara los finalistas mediante predicciones fuera de pliegue (OOF), selecciona el umbral por costo de errores dentro del rango operativo permitido, evalúa una sola vez el hold-out y registra `@champion` y `@challenger` en MLflow Model Registry. Exporta `docs/resultados_seleccion.csv` y `docs/corridas.csv`.
+
+**Importante:** el hold-out de 826 observaciones permanece reservado durante la comparación y optimización de modelos. La evaluación final se realiza en el notebook 05. Las ejecuciones de los notebooks 03–05 crean corridas y pueden registrar nuevas versiones, por lo que repetirlos modificará el historial de MLflow.
+
+**Interpretación del tuning:** Las configuraciones ajustadas incrementaron numéricamente la PR-AUC promedio de MLPClassifier (+0,0111), HistGradientBoosting (+0,0155) y LogisticRegression (+0,0161). Sin embargo, todas las diferencias fueron menores que las desviaciones estándar observadas entre los pliegues temporales. Por ello, el tuning se considera una exploración sistemática y reproducible de hiperparámetros, sin evidencia suficiente de mejoras robustas o estadísticamente significativas.
+
+### 5. Evaluación exploratoria con Ollama (opcional)
+
+El notebook `03_baseline_candidatos.ipynb` incluye una prueba real con el modelo local `qwen2.5:0.5b`. Esta comparación no interviene en la elección del champion.
+
+Instalar Ollama desde su sitio oficial y descargar el modelo:
+
+```powershell
+ollama pull qwen2.5:0.5b
+
+ollama list
+```
+
+Comprobar que el servicio local esté disponible en `http://localhost:11434` y activar `EJECUTAR_OLLAMA = True` en la sección correspondiente del notebook 03.
+
+**Resultado experimental:** 20 observaciones de validación, PR-AUC de 0,1833 para Ollama frente a 0,2416 para MLPClassifier, con latencia media de 2,91 segundos por caso. La comparación es exploratoria y no sustituye la validación cruzada temporal.
+
+### 6. Resultados, trazabilidad y pruebas
+
+Los resultados se conservan en:
+
+| Archivo | Contenido |
+|---|---|
+| `docs/resultados_modelos.csv` | Líneas base y candidatos por defecto |
+| `docs/resultados_tuning.csv` | Configuraciones y métricas de tuning |
+| `docs/resultados_seleccion.csv` | Comparación final de champion y challenger |
+| `docs/corridas.csv` | Corridas, métricas e identificadores de MLflow |
+
+La ejecución experimental definitiva registró **102 corridas activas**: 8 iniciales, 93 de tuning y una final.
+
+Para verificar el pipeline y la API sin depender de Snowflake ni del servidor MLflow se incluye un champion exportado en `tests/fixtures/modelo_champion/`, acompañado de su metadata y de una muestra fija de 826 observaciones.
+
+```powershell
+python -m pytest tests -v
+```
+
+**Resultado local verificado:** 14 pruebas aprobadas, 0 fallidas y 3 advertencias de dependencias, utilizando Python 3.14.6.
+
+Las pruebas cubren construcción de características, división temporal, preprocesamiento, contrato HTTP, reproducción de la PR-AUC, decisiones de negocio y funcionamiento del modo de respaldo.
+
+
+## Modelo final
+
+- **Champion:** Pipeline completo de scikit-learn con `HistGradientBoostingClassifier`, ajustado mediante `RandomizedSearchCV`.
+- **Model Registry:** `oralsolutions-modelo`, **versión 1**, alias `@champion`.
+- **Run ID:** `c90a1c37aef940278afc025b1d22dc6b`.
+- **Challenger:** `MLPClassifier`, **versión 2**, alias `@challenger`.
+- **Umbral operativo:** `0.01` (1 %), establecido como límite inferior para la selección por costos.
+
+### Métricas de selección y evaluación
+
+| Métrica | Champion (HGB) | Challenger (MLP) |
+|---|---:|---:|
+| PR-AUC CV temporal ajustada | 0,1852 ± 0,0597 | 0,1886 ± 0,0352 |
+| Costo estimado OOF (USD) | 3.459 | 5.019 |
+| PR-AUC hold-out | **0,159858** | 0,1666 |
+| ROC-AUC hold-out | 0,5642 | 0,5619 |
+| Recall hold-out | 100 % | 96,61 % |
+| Precisión hold-out | 14,36 % | 15,00 % |
+| Costo de errores hold-out (USD) | **2.112** | 2.418 |
+
+
+**Criterio de selección:** HistGradientBoosting se seleccionó como champion experimental por registrar el menor costo de errores entre los modelos finalistas en validación temporal OOF: USD 3.459 frente a USD 5.019 de MLPClassifier. La comparación utilizó costos hipotéticos de USD 120 por falso negativo y USD 3 por falso positivo, con un umbral operativo mínimo de 0,01. Aunque MLPClassifier obtuvo una PR-AUC promedio ligeramente superior, las diferencias fueron pequeñas frente a la variabilidad entre pliegues.
+
+**Comparación con políticas simples:** En validación OOF, contactar a todos presentó un costo estimado de USD 2.847, inferior al de ambos modelos. Por tanto, el champion fue el mejor de los candidatos entrenados, pero no superó la política más simple durante la selección.
+
+En el hold-out de 826 observaciones, HistGradientBoosting obtuvo un costo de USD 2.112, frente a USD 2.124 de contactar a todos. El modelo emitió 822 alertas, evitando únicamente cuatro contactos. La ventaja de USD 12 fue mínima y contrastó con los resultados OOF.
+
+**Conclusión económica:** No existe evidencia suficiente para afirmar que el champion supera de forma robusta a la política de contactar a todos. Los resultados dependen de costos hipotéticos, una tasa de rescate supuesta del 35 % y datos sintéticos. Se conserva el modelo para fines experimentales y de despliegue del prototipo, no como demostración de superioridad clínica o económica.
+
+### Recuperación del modelo registrado
+
+Con MLflow activo, el champion puede recuperarse mediante:
+
+```python
+import mlflow
+import mlflow.sklearn
+
+mlflow.set_tracking_uri("http://localhost:5000")
+
+modelo = mlflow.sklearn.load_model(
+    "models:/oralsolutions-modelo@champion"
+)
+```
+
+El modelo registrado reproduce una **PR-AUC de 0,159858** sobre las 826 observaciones del hold-out corregido. Esta comprobación también se realiza mediante `tests/test_modelo.py` utilizando el artefacto local exportado.
+
+La API del PSet 4 consume el alias `@champion` y aplica el umbral de decisión de 0,01. El modelo y sus métricas deben interpretarse considerando el origen sintético del dataset, la capacidad discriminativa limitada y la ausencia de validación causal de las intervenciones.
+
+**Documentación y evidencias:** `docs/PSet3_memo_Tiban.pdf`, `docs/corridas.csv`, `docs/resultados_modelos.csv`, `docs/resultados_tuning.csv` y `docs/resultados_seleccion.csv`.
