@@ -200,36 +200,6 @@ def test_contrato_valor_fuera_rango_devuelve_422(
     assert campo in resp.text
 
 
-@pytest.mark.parametrize(
-    "campo,valor",
-    [
-        ("duracion_estimada_min", -10),
-        ("numero_sesion", 0),
-        ("sesiones_planificadas", 1),
-        ("cancelaciones_previas", -1),
-        ("inasistencias_previas", -1),
-        ("dias_desde_inicio_plan", -5),
-        ("edad_en_atencion", 150),
-    ],
-)
-def test_contrato_valor_fuera_rango_devuelve_422(
-    client: TestClient,
-    campo: str,
-    valor: int,
-) -> None:
-    """Los valores fuera de los rangos válidos se rechazan."""
-
-    payload = {
-        **PAYLOAD_VALIDO,
-        campo: valor,
-    }
-
-    resp = client.post("/predecir", json=payload)
-
-    assert resp.status_code == 422
-    assert campo in resp.text
-
-
 def test_contrato_campo_extra_devuelve_422(
     client: TestClient,
 ) -> None:

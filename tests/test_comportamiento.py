@@ -53,7 +53,7 @@ def client(tmp_path: Path):
     api.cargar_modelo()
 
 
-def test_negocio_mayor_progreso_hacia_ultima_sesion_aumenta_riesgo(
+def test_api_reproduce_probabilidades_del_modelo(
     client: TestClient,
 ) -> None:
     """
@@ -101,7 +101,7 @@ def test_negocio_mayor_progreso_hacia_ultima_sesion_aumenta_riesgo(
         assert 0.0 <= body["probabilidad"] <= 1.0
 
 
-def test_negocio_paciente_critico_dispara_alerta_contactar(
+def test_decision_respeta_umbral_operativo(
     client: TestClient,
 ) -> None:
     """
