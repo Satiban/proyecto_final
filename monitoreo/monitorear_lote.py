@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import json
+import os
 from datetime import date
 import numpy as np
 import pandas as pd
@@ -9,6 +10,7 @@ from mlflow.tracking import MlflowClient
 from src.datos import conectar_snowflake
 from src.pipeline import (cargar_datos, construir_features, obtener_hash_datos,
                             FEATURES_NUM, FEATURES_CAT, FECHA_EVENTO)
+from src.reentrenar import dataset as dataset_snapshot, huella, SNAP
 from monitoreo.simular_produccion import (SIMULACION_ID, SCHEMA, PRED, LOTES,
                                         TRACKING_URI, HTTP_LOG, consultar_filas, ejecutar_sql)
 from monitoreo.deriva import evaluar_deriva_lote, diagnosticar_deriva
@@ -32,6 +34,60 @@ def insertar(conn, tabla, datos):
                  tuple(escalar(v) for v in datos.values()))
 
 
+def resolver_referencia(cliente, version, run, hash_datos, snapshot=None):
+    """Reconstruye la referencia del run exacto; no entrena ni escribe datos."""
+    nombre = os.getenv('MODEL_NAME', 'oralsolutions-modelo')
+    mv = cliente.get_model_version(nombre, str(version))
+    if mv.run_id != run:
+        raise RuntimeError('Version y run_id no coinciden en MLflow.')
+    registro = cliente.get_run(run)
+    corrida = registro.data
+    p = corrida.params
+    if registro.info.status != 'FINISHED' or p.get('hash_dataset') != hash_datos:
+        raise RuntimeError('Corrida no finalizada o huella del lote incompatible.')
+    media, std = (float(corrida.metrics[k]) for k in ('pr_auc_cv_mean', 'pr_auc_cv_std'))
+    if not np.isfinite([media, std]).all() or not 0 <= media <= 1 or not 0 <= std <= 1:
+        raise RuntimeError('Referencia CV invalida.')
+    horizonte = int(p['horizonte_dias'])
+    if horizonte != 60:
+        raise RuntimeError('Horizonte incompatible con la simulacion.')
+    corte = pd.Timestamp(p['fecha_corte'])
+    if corrida.tags.get('fase') == 'reentrenamiento':
+        if p.get('snapshot_id') != SNAP or (snapshot is not None and snapshot != SNAP):
+            raise RuntimeError('Snapshot de entrenamiento no soportado.')
+        base = dataset_snapshot()
+        limite = pd.Timestamp(p['limite_train'])
+        if limite + pd.Timedelta(days=horizonte) >= corte:
+            raise RuntimeError('Separacion temporal de reentrenamiento invalida.')
+        ref = base.loc[pd.to_datetime(base[FECHA_EVENTO]) <= limite].copy()
+        if (len(ref) != int(p['n_filas_entrenamiento']) or huella(base) != hash_datos
+                or huella(ref) != p['hash_train']):
+            raise RuntimeError('La referencia reconstruida no coincide con las huellas historicas.')
+    elif str(version) == '1' and corrida.tags.get('fase') == 'final':
+        if obtener_hash_datos() != hash_datos:
+            raise RuntimeError('La referencia local no coincide con el dataset historico.')
+        base = construir_features(cargar_datos())
+        ref = base.loc[pd.to_datetime(base[FECHA_EVENTO]) <= corte-pd.Timedelta(days=horizonte)].copy()
+        if len(ref) != 1195:
+            raise RuntimeError('Referencia de entrenamiento original inesperada.')
+    else:
+        raise RuntimeError('Procedencia de entrenamiento no soportada; no usar una referencia ajena.')
+    if ref.empty or not set(FEATURES_NUM + FEATURES_CAT).issubset(ref.columns):
+        raise RuntimeError('Referencia vacia o incompleta.')
+    return ref, corrida
+
+
+def verificar_referencia(version):
+    cliente = MlflowClient(tracking_uri=TRACKING_URI)
+    mv = cliente.get_model_version(os.getenv('MODEL_NAME', 'oralsolutions-modelo'), str(version))
+    corrida = cliente.get_run(mv.run_id).data
+    ref, corrida = resolver_referencia(cliente, version, mv.run_id, corrida.params['hash_dataset'])
+    print(f'[OK] Referencia v{version}: {len(ref)} observaciones | {len(FEATURES_NUM + FEATURES_CAT)} features')
+    print(f'Run ID: {mv.run_id}')
+    print(f"PR-AUC CV: {corrida.metrics['pr_auc_cv_mean']:.6f} +/- {corrida.metrics['pr_auc_cv_std']:.6f}")
+    print('[OK] Solo lectura: sin predicciones, entrenamiento ni escritura de metricas.')
+
+
 def monitorear(numero, fecha_virtual):
     lote = f'L{numero:02d}'
     clave = dict(SIMULACION_ID=SIMULACION_ID, LOTE_ID=lote)
@@ -48,18 +104,9 @@ def monitorear(numero, fecha_virtual):
         if estado not in ('esperando_target', 'evaluado') or fecha_virtual < cierre:
             raise RuntimeError('Lote incompleto o todavía no disponible en el reloj virtual.')
         cliente = MlflowClient(tracking_uri=TRACKING_URI)
-        corrida = cliente.get_run(run).data
-        if corrida.params['hash_dataset'] != hash_datos or obtener_hash_datos() != hash_datos:
-            raise RuntimeError('La referencia local no coincide con el dataset histórico del modelo.')
-        # Referencia original PSet03; para un modelo reentrenado deberá reconstruirse su ventana exacta.
-        if str(version) != '1':
-            raise RuntimeError('Referencia de entrenamiento de esta versión aún no implementada.')
-        corte = pd.Timestamp(corrida.params['fecha_corte'])
-        horizonte = int(corrida.params['horizonte_dias'])
-        base = construir_features(cargar_datos())
-        ref = base.loc[pd.to_datetime(base[FECHA_EVENTO]) <= corte-pd.Timedelta(days=horizonte)]
-        if len(ref) != 1195:
-            raise RuntimeError('Referencia de entrenamiento inesperada.')
+        ref, corrida = resolver_referencia(cliente, version, run, hash_datos, snapshot)
+        if corrida.tags.get('fase') == 'reentrenamiento' and pd.Timestamp(cierre) < pd.Timestamp(corrida.params['fecha_virtual']):
+            raise RuntimeError('El lote es anterior a la disponibilidad virtual del modelo reentrenado.')
         pred = consultar_filas(conn, f'''SELECT SESION_KEY, ENTRADAS_JSON, PROBABILIDAD, DECISION,
             LATENCIA_MS, VERSION_MODELO, RUN_ID, USO_RESPALDO FROM {PRED}
             WHERE SIMULACION_ID=%s AND LOTE_ID=%s AND ORIGEN='simulacion' ''', params)
@@ -156,6 +203,15 @@ def monitorear(numero, fecha_virtual):
 
 if __name__ == '__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--lote', type=int, required=True, choices=range(1,15))
-    p.add_argument('--fecha-virtual', type=date.fromisoformat, required=True)
-    a=p.parse_args(); monitorear(a.lote,a.fecha_virtual)
+    p.add_argument('--lote', type=int, choices=range(1,15))
+    p.add_argument('--fecha-virtual', type=date.fromisoformat)
+    p.add_argument('--verificar-version', type=int)
+    a=p.parse_args()
+    if a.verificar_version is not None:
+        if a.lote is not None or a.fecha_virtual is not None:
+            p.error('--verificar-version no admite lote ni fecha virtual')
+        verificar_referencia(a.verificar_version)
+    else:
+        if a.lote is None or a.fecha_virtual is None:
+            p.error('indique --lote y --fecha-virtual')
+        monitorear(a.lote,a.fecha_virtual)

@@ -385,7 +385,7 @@ El pipeline usa 13 predictores (10 numéricos y 3 categóricos), 23 columnas tra
 | `friccion_previa` | Cancelaciones e inasistencias acumuladas. |
 | `complejidad_proc` | Agrupación del procedimiento odontológico. |
 
-Las matrices transformadas esperadas son `(1195, 23)` y `(826, 23)`. Si el hash del CSV difiere, revisar la fuente y el entorno antes de asumir equivalencia. El monitoreo exige que el hash del dataset local coincida con el registrado para el modelo.
+Las matrices transformadas esperadas son `(1195, 23)` y `(826, 23)`. Si el hash del CSV difiere, revisar la fuente y el entorno antes de asumir equivalencia. Para el modelo original, el monitoreo exige que el hash del CSV local coincida con el registrado en MLflow. Para los modelos reentrenados compatibles, reconstruye la referencia desde los snapshots históricos de Snowflake y verifica las huellas de los datos y de la ventana de entrenamiento.
 
 ### 2. Levantar MLflow y preparar el kernel
 
@@ -399,7 +399,7 @@ python -m ipykernel install --user --name oralsolutions --display-name "Python (
 
 Abrir [MLflow](http://localhost:5000). El servidor usa MLflow 2.19.0 y el volumen `proyecto_final_datos_mlflow`. Los notebooks utilizan el experimento `OralSolutions`.
 
-Para una reproducción integral nueva, usar una instancia sin versiones previas de `oralsolutions-modelo` ni corridas previas que interfieran en la selección. El monitoreo y el notebook 06 requieren el champion v1. No borrar el volumen histórico; usar un entorno aislado. Una nueva corrida tendrá otro `run_id` aunque el entrenamiento sea equivalente.
+Para una reproducción integral nueva, usar una instancia sin versiones previas de `oralsolutions-modelo` ni corridas previas que interfieran en la selección. La reproducción del experimento histórico y el notebook 06 mantienen como referencia el champion v1. El monitoreo recupera dinámicamente las referencias de entrenamiento según la versión y el `run_id` asociados a cada lote, con soporte verificado para v1 y v3. No borrar el volumen histórico; usar un entorno aislado. Una nueva corrida tendrá otro `run_id` aunque el entrenamiento sea equivalente.
 
 ### 3. Ejecutar los notebooks de modelado
 
@@ -718,11 +718,35 @@ Con los snapshots creados, `python -m monitoreo.simular_produccion --verificar` 
 
 Abrir [Streamlit](http://localhost:8501) (si no está activo, `docker compose -p proyecto_final up -d tablero`). El tablero muestra métricas inmediatas, supervisadas, deriva, alertas, costos y reentrenamientos; también dispone de un panel de recepción para inferencia bajo demanda. Utilizar «Actualizar datos» para refrescar las consultas.
 
-El monitoreo inmediato revisa calidad, deriva y latencias; el supervisado calcula desempeño y costos con etiquetas maduras. El monitoreo compara los 13 predictores con las 1.195 observaciones originales de entrenamiento.
+El monitoreo inmediato revisa calidad, deriva y latencias; el supervisado calcula desempeño y costos con etiquetas maduras. El monitoreo compara los 13 predictores con la referencia de entrenamiento correspondiente a la versión y el `run_id` registrados en cada lote.
+
+Para el modelo original v1, utiliza las 1.195 observaciones de entrenamiento del CSV procesado del PSet3. Para los modelos reentrenados compatibles, reconstruye la ventana de entrenamiento desde los snapshots históricos de Snowflake, verificando sus huellas y metadatos en MLflow. Las métricas de validación cruzada se recuperan de la corrida correspondiente.
+
+Se verificaron las referencias de v1 y v3 sin generar predicciones, entrenar modelos ni modificar las tablas de monitoreo.
+
+#### Verificar referencias de monitoreo por versión
+
+Con MLflow activo, el CSV procesado original y los snapshots históricos disponibles, ejecutar desde la raíz del proyecto:
+
+```powershell
+python -m monitoreo.monitorear_lote --verificar-version 1
+python -m monitoreo.monitorear_lote --verificar-version 3
+```
+
+Resultados verificados el 25/11/2026:
+
+| Indicador | Champion v1 | Challenger v3 |
+|---|---:|---:|
+| Observaciones de entrenamiento | 1195 | 1745 |
+| Predictores | 13 | 13 |
+| PR-AUC CV | 0,185223 | 0,172867 |
+| Desviación estándar CV | 0,059669 | 0,045708 |
+
+Estas comprobaciones se realizan en modo de solo lectura. No generan predicciones, nuevas corridas ni versiones del modelo, y no modifican los alias ni las métricas almacenadas en Snowflake. El monitoreo integral posterior a una promoción efectiva permanece pendiente de validación.
 
 | Módulo | Función |
 |---|---|
-| `monitoreo/monitorear_lote.py` | Calidad, deriva y monitoreo inmediato. |
+| `monitoreo/monitorear_lote.py` | Calidad, deriva, monitoreo inmediato y recuperación de referencias por versión. |
 | `monitoreo/evaluar_lotes.py` | Evaluación de lotes maduros. |
 | `monitoreo/orquestar_monitoreo.py` | Coordina ambos momentos y actualiza alertas supervisadas. |
 | `monitoreo/deriva.py` | PSI, KS y chi-cuadrado. |
@@ -740,7 +764,7 @@ El monitoreo inmediato revisa calidad, deriva y latencias; el supervisado calcul
 | Errores HTTP | > 5 % | Alta |
 | Latencia HTTP p95 | > 250 ms | Media |
 
-Los umbrales AP se calculan a partir de la media CV menos una o dos desviaciones estándar, respectivamente; la condición crítica tiene prioridad. El PSI se complementa con KS y chi-cuadrado según el tipo de variable. Las alertas no disparan automáticamente el reentrenamiento ni la retirada.
+Los umbrales AP de la tabla corresponden al champion histórico v1. Estos se calculan dinámicamente a partir de la media CV menos una o dos desviaciones estándar de la corrida asociada a cada lote, respectivamente; la condición crítica tiene prioridad. El PSI se complementa con KS y chi-cuadrado según el tipo de variable. Las alertas no disparan automáticamente el reentrenamiento ni la retirada.
 
 Verificar los resultados en Snowsight:
 
@@ -819,7 +843,7 @@ Con los snapshots históricos existentes, champion v1 y MLflow activo, abrir `or
 fecha_virtual: "2026-01-01"
 ```
 
-El flujo entrena un challenger, registra métricas en `OralSolutions_Reentrenamiento` y se pausa en `pausa_aprobacion_humana`. Revisar los logs y las métricas; reanudar con `decision_humana` (`aprobar` o `rechazar`) y `motivo_decision`. Para la ejecución histórica se seleccionó `rechazar` porque el costo aumentó de USD 195 a USD 198. El flujo comprueba de nuevo la regla técnica y económica antes de promover. No se requiere ejecutar L09–L14 mediante FastAPI.
+El flujo verifica si la ventana histórica ya fue procesada. Cuando corresponde realizar un nuevo entrenamiento, entrena un challenger, registra métricas en `OralSolutions_Reentrenamiento` y se pausa en `pausa_aprobacion_humana`. Revisar los logs y las métricas; reanudar con `decision_humana` (`aprobar` o `rechazar`) y `motivo_decision`. Si la ventana ya fue procesada, omite el entrenamiento y la aprobación humana. Para la ejecución histórica se seleccionó `rechazar` porque el costo aumentó de USD 195 a USD 198. El flujo comprueba de nuevo la regla técnica y económica antes de promover. No se requiere ejecutar L09–L14 mediante FastAPI.
 
 | Indicador de L14 | Champion v1 | Challenger v3 histórico |
 |---|---:|---:|
@@ -839,7 +863,7 @@ Alternativa manual (en lugar de Kestra):
 python -m src.reentrenar entrenar --fecha-virtual 2026-01-01
 ```
 
-Recuperar el run ID emitido, revisar sus métricas y registrar la decisión real. Ejemplo histórico:
+Únicamente si se generó un nuevo challenger, recuperar el run ID emitido, revisar sus métricas y registrar la decisión real. Si la ventana ya fue procesada, no ejecutar nuevamente el comando de decisión. Ejemplo histórico:
 
 ```powershell
 python -m src.reentrenar decidir --run-id "<RUN_ID_GENERADO>" --decision rechazar --motivo "No reduce el costo de errores"
@@ -852,7 +876,7 @@ python -m src.reentrenar exportar
 Invoke-RestMethod -Uri "http://localhost:8000/modelo"
 ```
 
-Se actualizan `docs/corridas.csv` y `docs/reentrenamientos.csv`. Repetir el entrenamiento genera nuevas corridas, versiones y alias; no hacerlo solo para consultar evidencias. El monitoreo actual no reconstruye la referencia de modelos promovidos posteriores a v1.
+Se actualizan `docs/corridas.csv` y `docs/reentrenamientos.csv`. Un nuevo entrenamiento genera nuevas corridas, versiones y alias; el control de idempotencia impide repetir automáticamente una ventana histórica ya procesada. El monitoreo reconstruye las referencias de entrenamiento de modelos reentrenados compatibles utilizando sus metadatos en MLflow y los snapshots históricos de Snowflake. Se verificaron las referencias de v1 y v3; queda pendiente validar el monitoreo integral después de una promoción efectiva.
 
 ### Verificar el control de idempotencia
 
