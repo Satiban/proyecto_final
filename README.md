@@ -173,7 +173,7 @@ proyecto_final/
 │   ├── ingestar.py                      # Descarga y verificación de fuentes CSV
 │   ├── pipeline.py                      # Features, preprocesamiento y división temporal
 │   └── reentrenar.py                    # Reentrenamiento, evaluación y promoción
-├── tests/                                # Suite de 28 pruebas automatizadas
+├── tests/                                # Suite de 33 pruebas automatizadas
 │   ├── fixtures/                         # Artefactos fijos para pruebas independientes
 │   │   ├── modelo_champion/              # Modelo histórico exportado desde MLflow
 │   │   │   ├── conda.yaml                # Especificación del entorno Conda
@@ -188,6 +188,7 @@ proyecto_final/
 │   ├── __init__.py
 │   ├── test_comportamiento.py           # Consistencia, respaldo y seguridad administrativa
 │   ├── test_contrato.py                 # Validación de entradas y respuestas HTTP
+│   ├── test_firma_mlflow.py             # Compatibilidad Pydantic–Pipeline–MLflow
 │   ├── test_modelo.py                   # Reproducibilidad del modelo y sus métricas
 │   └── test_pipeline.py                 # Features, preprocesamiento y separación temporal
 ├── .env.example                          # Plantilla de variables de entorno
@@ -628,7 +629,7 @@ Respuesta histórica `HTTP 200` (ejemplo):
 }
 ```
 
-ID, timestamp, latencia y run ID (si se vuelve a entrenar) varían. Las entradas inválidas devuelven HTTP 422. En Linux también se puede usar Swagger UI para enviar el mismo JSON. La API valida nueve variables originales y construye los trece predictores con `src/pipeline.py`.
+ID, timestamp, latencia y run ID (si se vuelve a entrenar) varían. Las entradas inválidas devuelven HTTP 422. En Linux también se puede usar Swagger UI para enviar el mismo JSON. La API distingue dos contratos: el externo, compuesto por nueve atributos originales validados estrictamente mediante Pydantic, y el interno, compuesto por los trece predictores requeridos por la firma registrada en MLflow. Las cuatro características derivadas se calculan exclusivamente mediante `src/pipeline.py`, evitando inconsistencias introducidas por el cliente. Las pruebas automatizadas verifican la compatibilidad de nombres, orden, tipos y valores con la firma del modelo, así como el rechazo de características derivadas proporcionadas externamente.
 
 La predicción se registra en el CSV local de la API y, con persistencia habilitada, en `MLOPS.PREDICCIONES`. HTTP 200 no garantiza por sí solo la escritura en Snowflake; comprobar el ID de la respuesta y los logs si falta. Las solicitudes manuales no forman parte de L01–L08.
 
@@ -640,7 +641,7 @@ Desde la raíz, con `.venv` activo:
 python -m pytest tests -v --tb=short
 ```
 
-Resultado histórico: **28 pruebas aprobadas** en Python 3.14.6.
+Resultado verificado el 25/11/2026: **33 pruebas aprobadas** en Python 3.14.6, sin fallos. Se conservan las 28 pruebas originales y se incorporan cinco comprobaciones del contrato Pydantic–Pipeline–MLflow.
 
 | Archivo | Pruebas |
 |---|---:|
@@ -648,9 +649,10 @@ Resultado histórico: **28 pruebas aprobadas** en Python 3.14.6.
 | `tests/test_contrato.py` | 14 |
 | `tests/test_comportamiento.py` | 9 |
 | `tests/test_modelo.py` | 1 |
-| **Total** | **28** |
+| `tests/test_firma_mlflow.py` | 5 |
+| **Total** | **33** |
 
-No requieren Snowflake, Kestra ni MLflow: utilizan `tests/fixtures/modelo_champion/`, `modelo_meta.json` y `muestra_test.csv` (826 observaciones). La prueba del modelo reproduce AP = 0,159858 con tolerancia 0,0005. Si existe incompatibilidad de versiones, revisar los requisitos del fixture y `api/requirements.txt`.
+No requieren Snowflake, Kestra ni MLflow: utilizan `tests/fixtures/modelo_champion/`, `modelo_meta.json` y `muestra_test.csv` (826 observaciones). La prueba del modelo reproduce AP = 0,159858 con tolerancia 0,0005. Si existe incompatibilidad de versiones, revisar los requisitos del fixture y `api/requirements.txt`. Las pruebas de firma utilizan los metadatos de `tests/fixtures/modelo_champion/MLmodel` y `modelo_meta.json` para comprobar la compatibilidad efectiva de las características transformadas con el contrato registrado en MLflow, sin requerir un servidor activo. También verifican que el cliente no pueda proporcionar directamente las cuatro características derivadas.
 
 Solo para actualizar deliberadamente el fixture, con dataset y MLflow disponibles:
 
