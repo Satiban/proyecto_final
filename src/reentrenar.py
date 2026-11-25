@@ -52,7 +52,7 @@ def dataset():
 
 
 def huella(df):
-    return hashlib.sha256(df[['sesion_key',FECHA_EVENTO,*FEATURES_FINALES,TARGET]].to_csv(index=False).encode('utf-8')).hexdigest()
+    return hashlib.sha256(df[['sesion_key',FECHA_EVENTO,*FEATURES_FINALES,TARGET]].to_csv(index=False, lineterminator="\n").encode('utf-8')).hexdigest()
 
 
 def cliente():
@@ -60,7 +60,42 @@ def cliente():
     return MlflowClient(tracking_uri=URI)
 
 
-def entrenar(fecha_virtual, motivo):
+def revision_previa(c, train, test):
+    """No repetir una ventana histórica ni abrir otra revisión pendiente."""
+    exp = c.get_experiment_by_name('OralSolutions_Reentrenamiento')
+    if exp is None:
+        return None
+    ht, he = huella(train), huella(test)
+    # MLflow search_runs devuelve páginas; revisar todo el experimento.
+    token = None
+    while True:
+        runs = c.search_runs([exp.experiment_id], max_results=1000, page_token=token)
+        for run in runs:
+            p, t = run.data.params, run.data.tags
+            if t.get('decision_humana') == 'pendiente':
+                return f'Revision pendiente: {run.info.run_id}'
+            if t.get('fase') != 'reentrenamiento':
+                continue
+            misma_ventana = (
+                p.get('snapshot_id') == SNAP
+                and p.get('fecha_corte') == str(FECHA_EVAL_INICIO.date())
+                and p.get('limite_train') == str(LIMITE_TRAIN.date())
+                and p.get('lote_evaluacion') == 'L14'
+            )
+            if misma_ventana:
+                if (run.info.status == 'FINISHED'
+                    and t.get('estado_promocion') in ('rechazado', 'promovido', 'bloqueado_por_regla')
+                    and p.get('hash_train') == ht and p.get('hash_eval') == he):
+                    return f'Ventana ya procesada: {run.info.run_id}'
+                return (f'Ventana historica existente: {run.info.run_id}; '
+                        'revision manual requerida (huellas o estado no coinciden). '
+                        'No se entrenara automaticamente.')
+        token = runs.token
+        if not token:
+            return None
+
+
+def entrenar(fecha_virtual, motivo, solo_verificar=False):
     fecha = pd.Timestamp(fecha_virtual)
     if fecha < FECHA_CALENDARIO:
         raise ValueError('El disparador por calendario requiere fecha virtual >= 2026-01-01.')
@@ -69,7 +104,6 @@ def entrenar(fecha_virtual, motivo):
     corrida = c.get_run(mv.run_id).data
     umbral = float(mv.tags.get('umbral_decision', corrida.params.get('umbral_negocio','0.01')))
     std = float(corrida.metrics['pr_auc_cv_std'])
-    champion = mlflow.sklearn.load_model(f'models:/{NAME}/{mv.version}')
     df = dataset()
     train = df.loc[df[FECHA_EVENTO] <= LIMITE_TRAIN].copy()
     test = df.loc[df[FECHA_EVENTO].between(FECHA_EVAL_INICIO,FECHA_EVAL_FIN)].copy()
@@ -79,6 +113,12 @@ def entrenar(fecha_virtual, motivo):
         raise ValueError('Horizonte temporal inválido.')
     if set(train.sesion_key)&set(test.sesion_key):
         raise ValueError('Sesiones repetidas entre ventanas.')
+    omitir = revision_previa(c, train, test)
+    if omitir or solo_verificar:
+        print(f'[OK] {omitir or "Ventana disponible; verificacion sin entrenamiento."}')
+        print('::'+json.dumps({'outputs': {'entrenado': False, 'motivo': omitir or 'solo_verificar'}})+'::')
+        return
+    champion = mlflow.sklearn.load_model(f'models:/{NAME}/{mv.version}')
     # Mismo estimador e hiperparámetros, mismo preprocesador del champion.
     # Se usa el constructor compartido y se conserva su configuración exacta.
     pipe = construir_pipeline(clone(champion.named_steps['modelo']))
@@ -119,7 +159,7 @@ def entrenar(fecha_virtual, motivo):
     c.set_registered_model_alias(NAME,'challenger',v)
     print(json.dumps(dict(champion=dict(version=mv.version,**a),challenger=dict(version=v,**b),cumple_regla=cumple,
           n_train=len(train),n_eval=len(test),limite_train=str(LIMITE_TRAIN.date()),fecha_virtual=str(fecha.date())),indent=2))
-    print('::'+json.dumps({'outputs':{'run_id':rid,'version':v,'cumple_regla':cumple}})+'::')
+    print('::'+json.dumps({'outputs':{'run_id':rid,'version':v,'cumple_regla':cumple,'entrenado':True}})+'::')
 
 
 def decidir(run_id, decision, motivo):
@@ -150,8 +190,9 @@ def exportar():
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='accion',required=True)
     t=sub.add_parser('entrenar'); t.add_argument('--fecha-virtual',default='2026-01-01'); t.add_argument('--motivo',default='Calendario: revision programada posterior a simulacion')
+    t.add_argument('--solo-verificar', action='store_true')
     d=sub.add_parser('decidir'); d.add_argument('--run-id',required=True); d.add_argument('--decision',choices=['aprobar','rechazar'],required=True); d.add_argument('--motivo',required=True)
     sub.add_parser('exportar'); a=p.parse_args()
-    if a.accion=='entrenar': entrenar(a.fecha_virtual,a.motivo)
+    if a.accion=='entrenar': entrenar(a.fecha_virtual,a.motivo,a.solo_verificar)
     elif a.accion=='decidir': decidir(a.run_id,a.decision,a.motivo)
     else: exportar()

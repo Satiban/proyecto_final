@@ -1,6 +1,6 @@
 id: reentrenamiento
 namespace: oralsolutions.mlops
-description: Revisión por calendario, comparación temporal y aprobación humana.
+description: Revisión periódica del snapshot histórico, sin repetir ventanas, con aprobación humana.
 inputs:
   - id: fecha_virtual
     type: STRING
@@ -9,6 +9,13 @@ inputs:
 concurrency:
   limit: 1
   behavior: QUEUE
+triggers:
+  - id: revision_semanal
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 3 * * 1"
+    timezone: America/Guayaquil
+    inputs:
+      fecha_virtual: "2026-01-01"
 tasks:
   - id: entrenar_challenger
     type: io.kestra.plugin.scripts.python.Commands
@@ -27,34 +34,38 @@ tasks:
     commands:
       - cd /proyecto
       - python -m src.reentrenar entrenar --fecha-virtual "$FECHA_VIRTUAL"
-  - id: pausa_aprobacion_humana
-    type: io.kestra.plugin.core.flow.Pause
-    description: Revisar costos y PR-AUC en los logs antes de decidir.
-    onResume:
-      - id: decision_humana
-        type: SELECT
-        required: true
-        values: [aprobar, rechazar]
-        defaults: rechazar
-      - id: motivo_decision
-        type: STRING
-        required: true
-  - id: aplicar_decision_promocion
-    type: io.kestra.plugin.scripts.python.Commands
-    containerImage: python:3.14-slim
-    taskRunner:
-      type: io.kestra.plugin.scripts.runner.docker.Docker
-      networkMode: proyecto_final_default
-      volumes:
-        - "{{ envs.kestra_host_project_path }}:/proyecto:ro"
-    env:
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      PYTHONDONTWRITEBYTECODE: "1"
-      RUN_ID: "{{ outputs.entrenar_challenger.vars.run_id }}"
-      DECISION: "{{ outputs.pausa_aprobacion_humana.onResume.decision_humana }}"
-      MOTIVO: "{{ outputs.pausa_aprobacion_humana.onResume.motivo_decision }}"
-    beforeCommands:
-      - pip install -q -r /proyecto/api/requirements.txt python-dotenv==1.2.1
-    commands:
-      - cd /proyecto
-      - python -m src.reentrenar decidir --run-id "$RUN_ID" --decision "$DECISION" --motivo "$MOTIVO"
+  - id: revisar_si_entrenado
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.entrenar_challenger.vars.entrenado == true }}"
+    then:
+      - id: pausa_aprobacion_humana
+        type: io.kestra.plugin.core.flow.Pause
+        description: Revisar costos y PR-AUC en los logs antes de decidir.
+        onResume:
+          - id: decision_humana
+            type: SELECT
+            required: true
+            values: [aprobar, rechazar]
+            defaults: rechazar
+          - id: motivo_decision
+            type: STRING
+            required: true
+      - id: aplicar_decision_promocion
+        type: io.kestra.plugin.scripts.python.Commands
+        containerImage: python:3.14-slim
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: proyecto_final_default
+          volumes:
+            - "{{ envs.kestra_host_project_path }}:/proyecto:ro"
+        env:
+          MLFLOW_TRACKING_URI: http://mlflow:5000
+          PYTHONDONTWRITEBYTECODE: "1"
+          RUN_ID: "{{ outputs.entrenar_challenger.vars.run_id }}"
+          DECISION: "{{ outputs.pausa_aprobacion_humana.onResume.decision_humana }}"
+          MOTIVO: "{{ outputs.pausa_aprobacion_humana.onResume.motivo_decision }}"
+        beforeCommands:
+          - pip install -q -r /proyecto/api/requirements.txt python-dotenv==1.2.1
+        commands:
+          - cd /proyecto
+          - python -m src.reentrenar decidir --run-id "$RUN_ID" --decision "$DECISION" --motivo "$MOTIVO"

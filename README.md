@@ -831,7 +831,7 @@ El flujo entrena un challenger, registra métricas en `OralSolutions_Reentrenami
 | Falsos negativos | 0 | 0 |
 | Costo de errores (USD) | 195 | 198 |
 
-El challenger se entrenó con 1.745 observaciones hasta 2025-08-27. La promoción exige menor costo, AP no inferior a la del champion menos la desviación estándar CV de referencia (0,05967) y aprobación humana. Se mantuvo v1. La revisión por calendario virtual se activa explícitamente; no existe trigger automático por deterioro. El reentrenamiento usa datos originales, no los payloads alterados de L07–L08, y L14 pertenece al hold-out original.
+El challenger se entrenó con 1.745 observaciones hasta 2025-08-27. La promoción exige menor costo, AP no inferior a la del champion menos la desviación estándar CV de referencia (0,05967) y aprobación humana. Se mantuvo v1. La revisión preventiva dispone de un disparador automático semanal en Kestra (`revision_semanal`), configurado los lunes a las 03:00, zona horaria America/Guayaquil. El flujo incorpora un control de idempotencia mediante las huellas de los conjuntos de entrenamiento y evaluación, junto con la identificación del snapshot y la ventana temporal. Si la ventana ya fue procesada, finaliza sin generar nuevas corridas ni versiones del modelo. La simulación conserva una ventana histórica fija y no dispone de un disparador automático por deterioro predictivo.
 
 Alternativa manual (en lugar de Kestra):
 
@@ -853,6 +853,18 @@ Invoke-RestMethod -Uri "http://localhost:8000/modelo"
 ```
 
 Se actualizan `docs/corridas.csv` y `docs/reentrenamientos.csv`. Repetir el entrenamiento genera nuevas corridas, versiones y alias; no hacerlo solo para consultar evidencias. El monitoreo actual no reconstruye la referencia de modelos promovidos posteriores a v1.
+
+### Verificar el control de idempotencia
+
+Para comprobar si la ventana histórica ya fue procesada sin ejecutar un nuevo entrenamiento:
+
+```powershell
+python -m src.reentrenar entrenar --fecha-virtual 2026-01-01 --solo-verificar
+```
+
+La comprobación histórica realizada el 25/11/2026, tanto desde el entorno local como desde Kestra, reconoció la corrida `7a1b8f68e3f041ecaeed49b117418d52` y omitió el entrenamiento. Se verificó que la API conservó el champion v1.
+
+La ejecución manual en Kestra validó el control de idempotencia, mientras que el disparador semanal quedó configurado para las revisiones programadas.
 
 ### 8. Integración y entrega continua (CI/CD)
 
