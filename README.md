@@ -1,542 +1,552 @@
 # OralSolutions — Predicción de abandono de tratamientos odontológicos
 
-Proyecto de ciencia de datos para preparar, analizar y modelar información clínica, operativa y financiera de una clínica odontológica simulada, **OralSolutions**. Su objetivo es estimar el riesgo de que un paciente no continúe su tratamiento dentro de los **60 días posteriores a una cita atendida**, para apoyar la priorización de contactos preventivos y reprogramaciones.
+Proyecto end-to-end de ciencia de datos para una clínica odontológica simulada. Estima el riesgo de que un paciente con sesiones pendientes no continúe su tratamiento durante los 60 días posteriores a una sesión atendida, para apoyar al personal de recepción en la priorización de contactos preventivos y reprogramaciones.
 
-**Objetivo de negocio:** incrementar en **10 puntos porcentuales** la tasa de continuidad de tratamientos a 60 días respecto al seguimiento reactivo habitual. Esta es una **meta del proyecto**, no un resultado observado. Como política operativa propuesta, se contempla activar alertas cuando la probabilidad estimada de abandono sea al menos **1 %** (`umbral = 0.01`); su eficacia y costo deben evaluarse con los resultados del modelo.
+**Métrica de éxito:** incrementar la continuidad a 60 días en 10 puntos porcentuales respecto al seguimiento reactivo (meta aspiracional, no resultado clínico observado). El modelo se selecciona por el costo estimado de errores `C = 120 × FN + 3 × FP`, con Average Precision (AP, denominada PR-AUC en el proyecto) como métrica técnica principal. El umbral operativo definitivo es **0,01**: a partir de ese valor se recomienda contactar al paciente, bajo supervisión humana.
+
+![Arquitectura end-to-end de OralSolutions](docs/arquitectura.png)
+
+**Orden de ejecución:** preparar y obtener los datos → ejecutar el pipeline ELT → entrenar y registrar el modelo → levantar el servicio → simular, monitorear y evaluar el reentrenamiento. Si ya existe una etapa completada, se puede continuar desde la siguiente sin repetirla. Los CSV de `docs/` son evidencias históricas, no reemplazan las tablas de Snowflake ni los artefactos de MLflow.
 
 ## Datos
 
-El dataset **sintético** de OralSolutions comprende **11 archivos CSV y 38.603 registros de origen**. Se creó para simular operaciones odontológicas y permitir el análisis de calidad, la transformación y el modelado sin emplear historias clínicas reales.
+Se utiliza un dataset sintético de 11 CSV, 38.603 registros y 69 columnas distribuidas entre las fuentes, con histórico 2024–2025. Se elaboró tomando como referencia *Dental Clinic Appointments and Billing Dataset* de DatabaseSample (2026), adaptado a OralSolutions; no contiene historias clínicas reales.
 
-| Archivo | Registros | Contenido principal |
-|---|---:|---|
-| `appointments.csv` | 7.788 | Citas odontológicas |
-| `dentists.csv` | 5 | Odontólogos |
-| `insurers.csv` | 4 | Aseguradoras |
-| `invoices.csv` | 7.788 | Facturación |
-| `missed_appointments.csv` | 1.500 | Cancelaciones e inasistencias |
-| `patient_followups.csv` | 1.243 | Seguimiento y contacto con pacientes |
-| `patients.csv` | 2.500 | Pacientes |
-| `procedures.csv` | 10 | Catálogo de procedimientos |
-| `treatment_lines.csv` | 7.956 | Líneas de tratamiento/procedimientos |
-| `treatment_plans.csv` | 3.015 | Planes de tratamiento |
-| `treatment_sessions.csv` | 6.794 | Eventos e intentos de sesiones |
-| **Total** | **38.603** | **11 fuentes** |
+Todos los archivos se obtienen de la [carpeta de Google Drive de OralSolutions](https://drive.google.com/drive/folders/1bDd9OOZ1SPTLjnGQld5IIn-x4Gp8KQIh?usp=drive_link). Los catálogos no tienen necesariamente fecha propia; el período corresponde al histórico operativo del conjunto.
 
-**Ubicación local:** `data/raw/*.csv`. En la configuración actual, los archivos de datos están excluidos del repositorio mediante `.gitignore`.
+| Fuente | Qué contiene (filas × columnas) | Cómo se obtiene | Dónde queda |
+|---|---|---|---|
+| Citas | 7.788 × 6; paciente, odontólogo, fecha, tipo y cobertura | Google Drive / `src/ingestar.py` | `data/raw/appointments.csv` |
+| Odontólogos | 5 × 5; identificación, contrato y fecha de ingreso | Google Drive / script | `data/raw/dentists.csv` |
+| Aseguradoras | 4 × 4; esquema, plan y cobertura | Google Drive / script | `data/raw/insurers.csv` |
+| Facturas | 7.788 × 6; cita, emisión, estado y pago | Google Drive / script | `data/raw/invoices.csv` |
+| Citas perdidas | 1.500 × 5; paciente, odontólogo, fecha y resultado | Google Drive / script | `data/raw/missed_appointments.csv` |
+| Seguimientos | 1.243 × 5; plan, fecha, método y resultado del contacto | Google Drive / script | `data/raw/patient_followups.csv` |
+| Pacientes | 2.500 × 8; identificación, nacimiento, cobertura y registro | Google Drive / script | `data/raw/patients.csv` |
+| Procedimientos | 10 × 6; código, nombre, tarifa y duración | Google Drive / script | `data/raw/procedures.csv` |
+| Líneas de tratamiento | 7.956 × 6; cita, procedimiento e importes | Google Drive / script | `data/raw/treatment_lines.csv` |
+| Planes de tratamiento | 3.015 × 10; paciente, procedimiento, sesiones, estado y fechas | Google Drive / script | `data/raw/treatment_plans.csv` |
+| Sesiones de tratamiento | 6.794 × 8; plan, cita, número, fechas y estado | Google Drive / script | `data/raw/treatment_sessions.csv` |
+| **Total** | **38.603 filas / 69 columnas acumuladas** | | |
 
-### Obtención de los CSV
+### Obtener el repositorio y preparar Python
 
-Desde la raíz de `proyecto_final/`:
+Requisitos: Git, Python 3.14.6 (entorno local verificado), Internet, Docker con Compose y contenedores Linux, cuenta Snowflake con permisos suficientes y VS Code con extensiones Python/Jupyter o equivalente.
+
+Desde GitHub, copiar la URL del repositorio en **Code → HTTPS**. Sustituir el marcador por la URL copiada:
+
+```powershell
+git clone https://github.com/Satiban/proyecto_final.git
+cd proyecto_final
+python --version
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+En Linux, usar `python3 -m venv .venv` y `source .venv/bin/activate`. Los ejemplos siguientes utilizan PowerShell y se ejecutan desde la raíz `proyecto_final/` (donde está `docker-compose.yml`), salvo los SQL, que se ejecutan en Snowsight, y los flujos, que se ejecutan en Kestra.
+
+El `requirements.txt` raíz contiene las dependencias de desarrollo y notebooks; `api/requirements.txt` contiene las de API y tareas MLOps. dbt y Spark se ejecutan en Docker. Mantener versiones compatibles con `tests/fixtures/modelo_champion/requirements.txt`, especialmente scikit-learn, NumPy y pandas, para cargar el artefacto serializado. La verificación local se describe en «Cómo correr el servicio» y puede ejecutarse antes de configurar Snowflake.
+
+### Descargar los datos
+
+Con `.venv` activo:
 
 ```powershell
 python src/ingestar.py
 ```
 
-El script comprueba la presencia de los 11 archivos; si falta alguno, intenta descargarlos desde la carpeta compartida de Google Drive. Si están todos presentes, informa del número de archivos y del total de filas calculado a partir de los CSV. **Este conteo no sustituye una auditoría de integridad del contenido**.
+El script crea `data/raw/`, verifica los 11 archivos esperados y descarga desde Google Drive cuando falta alguno. Resultado de referencia: 11 CSV y 38.603 registros. Si falla la descarga automática, descargar manualmente los archivos del enlace anterior, colocarlos directamente en `data/raw/` y repetir el comando. Kestra también invoca este script durante la ingesta.
 
-Como alternativa, descargar manualmente los archivos desde la [carpeta de Google Drive de OralSolutions](https://drive.google.com/drive/folders/1bDd9OOZ1SPTLjnGQld5IIn-x4Gp8KQIh?usp=drive_link), colocarlos en `data/raw/` y volver a ejecutar el script.
-
-La ingesta también se invoca desde Kestra mediante el subflujo `kestra/ingest_raw_oralsolutions.yml`.
+Los CSV crudos y procesados no se versionan en Git. Se recupera el dataset original desde Drive, no se vuelve a generar aleatoriamente. El conjunto etiquetado se reconstruye en la etapa de modelado.
 
 ## Cómo correr el pipeline de datos
 
-La arquitectura ELT comprobada es:
+**Flujo ELT:** Google Drive → Kestra → Snowflake RAW → dbt Bronze/Silver/Gold → Spark → Snowflake OBT. PostgreSQL conserva el estado de Kestra. El diagrama dimensional está disponible en [docs/modelo_dimensional.png](docs/modelo_dimensional.png).
 
-```text
-11 CSV → Kestra → Snowflake RAW → dbt Bronze → dbt Silver
-                                      → dbt Gold → Apache Spark → Snowflake OBT
-```
+### Estructura del proyecto
 
-- **Kestra:** orquesta la ingesta, las transformaciones, las pruebas y la generación de la OBT.
-- **Snowflake RAW:** almacena las 11 fuentes cargadas.
-- **dbt Core:** construye Bronze (tipificación), Silver (depuración y normalización) y Gold (esquema dimensional), además de ejecutar pruebas.
-- **Apache Spark:** lee Gold, verifica las claves y los joins, calcula variables históricas y escribe `OBT.OBT_RIESGO_ABANDONO`.
-- **Procesamiento batch:** el flujo maestro incorpora un horario diario a las 02:00 (`America/Guayaquil`); la ejecución manual completa ya se verificó, mientras que la ejecución automática por horario todavía debe comprobarse de forma separada.
-
-### 1. Estructura del proyecto
-
-La estructura **actual** utiliza la raíz `proyecto_final/`, sin las carpetas antiguas `infra/`, `warehouse/`, `procesamiento/` o `modelado/` mencionadas en versiones previas del README.
+Árbol de los archivos del repositorio según el inventario revisado, excluyendo los archivos obsoletos identificados durante la auditoría. Las carpetas de datos se crean durante la ejecución y los dos PDF del PSet4 corresponden a la entrega final.
 
 ```text
 proyecto_final/
-├── .github/
+├── .github/                              # Automatización de CI/CD
 │   └── workflows/
-│       ├── ci.yml
-│       └── cd.yml
-├── api/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   ├── esquemas.py
-│   ├── exportar_modelo.py
-│   └── main.py
-├── monitoreo/
-│   ├── alertas.py
-│   ├── deriva.py
-│   ├── simular_produccion.py
-│   ├── evaluar_lotes.py
-│   ├── monitorear_lote.py
-│   ├── orquestar_monitoreo.py
-│   └── tablero.py
-├── notebooks/
-│   ├── 01_eda.ipynb
-│   ├── 02_features.ipynb
-│   ├── 03_baseline_candidatos.ipynb
-│   ├── 04_tuning.ipynb
-│   ├── 05_seleccion.ipynb
-│   ├── 06_simulacion_produccion.ipynb
-│   └── 07_analisis_monitoreo.ipynb
-├── scripts/
-│   └── demostrar_rollback.py
-├── sql/
-│   └── mlops/
-├── src/
-│   ├── ingestar.py
-│   ├── datos.py
-│   ├── pipeline.py
-│   └── reentrenar.py
-└── docs/
-    ├── historial/
-    ├── arquitectura.png
-    ├── modelo_dimensional.png
-    ├── cambios.md
-    ├── alertas.csv
-    ├── corridas.csv
-    ├── deriva_features.csv
-    ├── equidad.csv
-    ├── lotes_produccion.csv
-    ├── monitoreo.csv
-    ├── monitoreo_inmediato.csv
-    ├── predicciones.csv
-    ├── predicciones_demostracion.csv
-    ├── reentrenamientos.csv
-    ├── resultados_modelos.csv
-    ├── resultados_seleccion.csv
-    ├── resultados_tuning.csv
-    └── solicitudes_http.csv
+│       ├── cd.yml                        # Construcción y publicación de la API en GHCR
+│       └── ci.yml                        # Validación mediante pruebas automatizadas
+├── api/                                  # Servicio de predicción con FastAPI
+│   ├── __init__.py
+│   ├── Dockerfile                        # Imagen Docker del servicio
+│   ├── esquemas.py                       # Contratos y validaciones con Pydantic
+│   ├── exportar_modelo.py                # Exportación del champion para pruebas locales
+│   ├── main.py                           # Endpoints, inferencia, persistencia y respaldo
+│   └── requirements.txt                  # Dependencias de API y tareas MLOps
+├── calidad/                              # Diagnóstico y limpieza de datos
+│   ├── diagnostico_proyecto.ipynb        # Evaluación de calidad de las fuentes originales
+│   └── limpiar.py                        # Ejecución de transformaciones y pruebas Silver
+├── config/                               # Plantillas de configuración
+│   └── dbt/
+│       └── profiles.example.yml          # Plantilla de conexión dbt–Snowflake
+├── data/                                 # Datos locales excluidos de Git
+│   ├── processed/                        # Dataset etiquetado generado para modelado
+│   └── raw/                              # Once archivos CSV descargados de Google Drive
+├── dbt/                                  # Transformaciones ELT y pruebas de calidad
+│   ├── macros/
+│   │   └── generate_schema_name.sql      # Personalización de esquemas en Snowflake
+│   ├── models/                           # 28 modelos de transformación
+│   │   ├── bronze/                       # Tipificación y estandarización
+│   │   ├── gold/                         # Dimensiones y tabla de hechos
+│   │   └── silver/                       # Limpieza, normalización y consistencia
+│   ├── tests/                            # Pruebas personalizadas de calidad
+│   │   ├── gold/                         # Validaciones del modelo dimensional
+│   │   └── silver/                       # Validaciones de datos normalizados
+│   ├── .gitignore
+│   └── dbt_project.yml                   # Configuración general de dbt
+├── docs/                                 # Documentación y evidencias experimentales
+│   ├── historial/                        # Entregables históricos corregidos
+│   │   ├── PSet1_memo_Tiban.pdf
+│   │   ├── PSet1_pitch_Tiban.pdf
+│   │   ├── PSet2_memo_Tiban.pdf
+│   │   └── PSet3_memo_Tiban.pdf
+│   ├── alertas.csv                       # Alertas generadas durante el monitoreo
+│   ├── arquitectura.png                  # Diagrama de arquitectura end-to-end
+│   ├── cambios.md                        # Registro de correcciones y ajustes
+│   ├── corridas.csv                      # Historial consolidado de corridas MLflow
+│   ├── deriva_features.csv               # Métricas de deriva por predictor
+│   ├── equidad.csv                       # Evaluación de desempeño por subgrupos
+│   ├── lotes_produccion.csv              # Control y maduración de lotes simulados
+│   ├── modelo_dimensional.png            # Diagrama del esquema estrella
+│   ├── monitoreo.csv                     # Métricas supervisadas y costos por lote
+│   ├── monitoreo_inmediato.csv           # Métricas operativas sin etiquetas maduras
+│   ├── predicciones.csv                  # Predicciones de producción simulada
+│   ├── predicciones_demostracion.csv     # Evidencias de rollback y respaldo
+│   ├── PSet4_memo_Tiban.pdf               # Documento técnico integral
+│   ├── PSet4_presentacion_Tiban.pdf       # Presentación ejecutiva final
+│   ├── reentrenamientos.csv              # Corridas y decisiones de promoción
+│   ├── resultados_modelos.csv            # Comparación de líneas base y candidatos
+│   ├── resultados_seleccion.csv          # Evaluación y selección del champion
+│   ├── resultados_tuning.csv             # Resultados de optimización de hiperparámetros
+│   └── solicitudes_http.csv              # Telemetría HTTP de producción simulada
+├── kestra/                               # Flujos de orquestación ELT y MLOps
+│   ├── backfill_oralsolutions.yml        # Recuperación histórica parametrizada
+│   ├── ingest_raw_oralsolutions.yml      # Descarga y carga idempotente en RAW
+│   ├── ingesta.yml                       # Flujo maestro ELT con programación diaria
+│   ├── monitoreo.yml                     # Monitoreo inmediato y supervisado
+│   ├── produccion_lotes.yml              # Simulación de inferencia por lote
+│   ├── reentrenamiento.yml               # Entrenamiento y aprobación humana
+│   ├── simulacion_completa.yml           # Orquestación secuencial de lotes L04–L14
+│   ├── test_dbt_docker.yml               # Ejecución de modelos y pruebas dbt
+│   └── test_spark_docker.yml             # Construcción de la OBT mediante Spark
+├── monitoreo/                            # Simulación, observabilidad y operación MLOps
+│   ├── alertas.py                       # Reglas, severidades y registro de alertas
+│   ├── deriva.py                        # Cálculo de PSI, KS y chi-cuadrado
+│   ├── evaluar_lotes.py                 # Evaluación de lotes con etiquetas maduras
+│   ├── monitorear_lote.py               # Monitoreo inmediato de calidad y deriva
+│   ├── orquestar_monitoreo.py            # Coordinación de las etapas de monitoreo
+│   ├── simular_produccion.py             # Simulación histórica mediante la API
+│   └── tablero.py                       # Dashboard Streamlit y panel de recepción
+├── notebooks/                            # Experimentación y análisis reproducible
+│   ├── 01_eda.ipynb                      # Análisis exploratorio de datos
+│   ├── 02_features.ipynb                 # Ingeniería de variables y ablación
+│   ├── 03_baseline_candidatos.ipynb      # Comparación de modelos y prueba con Ollama
+│   ├── 04_tuning.ipynb                   # Optimización de hiperparámetros
+│   ├── 05_seleccion.ipynb                # Evaluación final y registro de modelos
+│   ├── 06_simulacion_produccion.ipynb    # Consulta y exportación de predicciones
+│   └── 07_analisis_monitoreo.ipynb       # Análisis de deriva, equidad, costos y reentrenamiento
+├── scripts/                              # Utilidades de demostración
+│   └── demostrar_rollback.py            # Cambio y restauración de versiones del modelo
+├── spark/                                # Procesamiento analítico con Apache Spark
+│   ├── job_spark.py                     # Integración dimensional y construcción de la OBT
+│   └── verificar_conexion.py            # Comprobación de conectividad con Snowflake
+├── sql/                                  # Inicialización de estructuras en Snowflake
+│   ├── mlops/                            # Esquema operativo de MLOps
+│   │   ├── 01_crear_predicciones.sql     # Registro de predicciones individuales
+│   │   ├── 02_preparar_simulacion.sql    # Trazabilidad y control de lotes
+│   │   ├── 03_crear_monitoreo.sql        # Métricas supervisadas por lote
+│   │   ├── 04_crear_monitoreo_inmediato.sql # Métricas inmediatas, deriva y alertas
+│   │   └── 05_crear_telemetria_http.sql   # Registro de solicitudes HTTP
+│   ├── 01_setup_snowflake.sql            # Creación de warehouse, base y esquemas
+│   └── 02_create_raw_tables.sql          # Creación de tablas RAW, stage y formato CSV
+├── src/                                  # Lógica reutilizable del proyecto
+│   ├── __init__.py
+│   ├── datos.py                         # Extracción y construcción del target a 60 días
+│   ├── ingestar.py                      # Descarga y verificación de fuentes CSV
+│   ├── pipeline.py                      # Features, preprocesamiento y división temporal
+│   └── reentrenar.py                    # Reentrenamiento, evaluación y promoción
+├── tests/                                # Suite de 28 pruebas automatizadas
+│   ├── fixtures/                         # Artefactos fijos para pruebas independientes
+│   │   ├── modelo_champion/              # Modelo histórico exportado desde MLflow
+│   │   │   ├── conda.yaml                # Especificación del entorno Conda
+│   │   │   ├── input_example.json       # Ejemplo de entrada del modelo
+│   │   │   ├── MLmodel                  # Metadatos y configuración MLflow
+│   │   │   ├── model.pkl                # Pipeline del modelo serializado
+│   │   │   ├── python_env.yaml           # Especificación del entorno Python
+│   │   │   ├── requirements.txt          # Dependencias del modelo exportado
+│   │   │   └── serving_input_example.json # Ejemplo de entrada para inferencia
+│   │   ├── modelo_meta.json              # Identidad, métricas y umbral del champion
+│   │   └── muestra_test.csv              # 826 observaciones del hold-out
+│   ├── __init__.py
+│   ├── test_comportamiento.py           # Consistencia, respaldo y seguridad administrativa
+│   ├── test_contrato.py                 # Validación de entradas y respuestas HTTP
+│   ├── test_modelo.py                   # Reproducibilidad del modelo y sus métricas
+│   └── test_pipeline.py                 # Features, preprocesamiento y separación temporal
+├── .env.example                          # Plantilla de variables de entorno
+├── .gitignore                            # Exclusión de credenciales y archivos locales
+├── conftest.py                           # Configuración compartida de pytest
+├── docker-compose.yml                    # Definición de servicios, redes y volúmenes
+├── Dockerfile.dbt                        # Imagen personalizada de dbt Core
+├── README.md                             # Guía de configuración, ejecución y reproducción
+└── requirements.txt                      # Dependencias generales de Python
 ```
 
-### 2. Requisitos previos y entorno Python
+Los directorios `data/raw/` y `data/processed/`, los archivos privados `.env` y `config/dbt/profiles.yml`, los logs, cachés, entornos virtuales y artefactos de ejecución no se versionan. La excepción es el modelo exportado en `tests/fixtures/`, necesario para ejecutar las pruebas sin MLflow ni Snowflake. Para comprobar el inventario real del checkout, ejecutar `git ls-files` desde la raíz.
 
-- Docker Desktop con Docker Compose y contenedores Linux.
-- Python 3.11 o compatible con las dependencias de `requirements.txt`.
-- Cuenta de Snowflake con permisos suficientes para crear o utilizar el warehouse, la base de datos, los esquemas, las tablas y el stage. El entorno comprobado utiliza el rol `ACCOUNTADMIN`; para un despliegue real se recomienda un rol de privilegios mínimos.
-- Internet para Google Drive, Snowflake, imágenes Docker y paquetes Maven utilizados por Spark.
+### 1. Configurar Snowflake y credenciales
 
-Los siguientes comandos están pensados para **PowerShell en Windows**, ejecutados desde `proyecto_final/`:
+Para una instalación nueva, usar recursos aislados de otras ejecuciones del proyecto. Los scripts emplean nombres fijos de base de datos y esquemas. No borrar tablas, snapshots ni volúmenes de una ejecución histórica para volver a demostrar el proyecto.
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+Abrir Snowsight y ejecutar en orden:
 
-En Linux:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 3. Preparar Snowflake y configurar credenciales
-
-**Recursos utilizados en la implementación verificada:**
-
-| Recurso | Valor |
+| Archivo | Resultado |
 |---|---|
-| Base de datos | `ORALSOLUTIONS_DW` |
-| Warehouse | `COMPUTE_WH` |
-| Esquemas | `RAW`, `BRONZE`, `SILVER`, `GOLD`, `OBT` |
-| Rol usado en las pruebas | `ACCOUNTADMIN` |
-| Stage CSV | `RAW.RAW_CSV_STAGE` |
-| Formato CSV | `RAW.CSV_RAW_FORMAT` |
+| `sql/01_setup_snowflake.sql` | Warehouse `COMPUTE_WH`, base `ORALSOLUTIONS_DW` y esquemas `RAW`, `BRONZE`, `SILVER`, `GOLD`, `OBT`. |
+| `sql/02_create_raw_tables.sql` | 11 tablas RAW, formato `CSV_RAW_FORMAT` y stage `RAW.RAW_CSV_STAGE`. |
 
-**Inicialización en Snowflake:** antes de lanzar una carga en una cuenta vacía, se deben ejecutar los scripts SQL de preparación del entorno (creación de base de datos y esquemas, 11 tablas RAW, formato de CSV y stage). **Verificar la ubicación exacta de esos scripts en la copia definitiva del proyecto**; las rutas antiguas `infra/sql/` o `sql/` no deben suponerse válidas sin comprobarlas. La inicialización no crea necesariamente un usuario Snowflake.
+Se requiere una cuenta Snowflake con los permisos correspondientes. El entorno académico usa `ACCOUNTADMIN`; para producción se recomienda un rol de privilegios mínimos. Las operaciones pueden consumir créditos de Snowflake.
 
-Crear los archivos privados a partir de sus plantillas:
+Crear los archivos de configuración privados, únicamente si no existen:
 
 ```powershell
 Copy-Item .env.example .env
 Copy-Item config/dbt/profiles.example.yml config/dbt/profiles.yml
 ```
 
-Configurar los valores requeridos por Docker, Kestra y Spark. Entre ellos:
+En Linux, usar `cp`. Completar `.env` conforme a su plantilla:
 
-- **Kestra / Docker:** `KESTRA_DB_PASSWORD`, `KESTRA_ADMIN_EMAIL`, `KESTRA_ADMIN_PASSWORD`, `ENV_SNOWFLAKE_URL`, `ENV_SNOWFLAKE_USER`, `SECRET_SNOWFLAKE_PASSWORD` y `ENV_KESTRA_HOST_PROJECT_PATH`.
-- **Spark:** `SF_ACCOUNT`, `SF_USER`, `SF_DATABASE=ORALSOLUTIONS_DW`, `SF_WAREHOUSE=COMPUTE_WH`, `SF_ROLE=ACCOUNTADMIN`, `SF_GOLD_SCHEMA=GOLD`, `SF_OBT_SCHEMA=OBT` y `SECRET_SNOWFLAKE_PASSWORD`.
-- **dbt:** en `config/dbt/profiles.yml`, mantener el perfil `oralsolutions` y configurar cuenta, usuario, contraseña, warehouse, rol, base de datos y target `dev` según la plantilla local.
+| Variable | Valor o configuración |
+|---|---|
+| `KESTRA_DB_PASSWORD` | Contraseña de PostgreSQL local. |
+| `KESTRA_ADMIN_EMAIL`, `KESTRA_ADMIN_PASSWORD` | Acceso local a Kestra. |
+| `ENV_SNOWFLAKE_URL` | `jdbc:snowflake://<IDENTIFICADOR_CUENTA>.snowflakecomputing.com` |
+| `ENV_SNOWFLAKE_USER`, `SF_USER` | Usuario Snowflake. |
+| `SF_ACCOUNT` | Identificador de cuenta, sin protocolo ni dominio. |
+| `SECRET_SNOWFLAKE_PASSWORD`, `SF_PASSWORD` | Contraseña Snowflake en Base64 UTF-8 (repetir el valor conforme a la plantilla). |
+| `SNOWFLAKE_ROLE`, `SF_ROLE` | `ACCOUNTADMIN` en el entorno académico. |
+| `SNOWFLAKE_WAREHOUSE`, `SF_WAREHOUSE` | `COMPUTE_WH` |
+| `SNOWFLAKE_DATABASE`, `SF_DATABASE` | `ORALSOLUTIONS_DW` |
+| `SNOWFLAKE_SCHEMA` | `RAW` |
+| `SF_GOLD_SCHEMA`, `SF_OBT_SCHEMA`, `SF_MLOPS_SCHEMA` | `GOLD`, `OBT`, `MLOPS`, respectivamente. |
+| `ENV_KESTRA_HOST_PROJECT_PATH` | Ruta absoluta del repositorio visible para Docker. |
+| `ADMIN_TOKEN`, `MODO_RESPALDO` | Token privado y `false`. |
+| `API_IMAGE`, `API_PULL_POLICY` | `proyecto_final-api:latest`, `build`. |
 
-La variable `SECRET_SNOWFLAKE_PASSWORD` utilizada por el trabajo de Spark y los flujos correspondientes contiene la contraseña codificada en **Base64 UTF-8**. Base64 **no es cifrado** y no debe considerarse un mecanismo de protección. Para generar el valor:
+Generar la contraseña Base64 y el token administrativo con:
 
 ```powershell
 python -c "import base64,getpass; print(base64.b64encode(getpass.getpass('Contraseña Snowflake: ').encode('utf-8')).decode('ascii'))"
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-**Importante para Windows:** guardar `.env` en **UTF-8 con saltos de línea LF**, porque el flujo actual de Spark lo carga desde Linux mediante `. /config/.env`. Este ajuste solucionó el error de lectura observado con CRLF. El archivo debe contener asignaciones compatibles con shell. No publicar `.env`, `profiles.yml`, contraseñas ni tokens.
+Guardar los resultados en `.env`, sin compartirlos. Base64 es una codificación, no cifrado. En `config/dbt/profiles.yml`, completar cuenta, usuario y contraseña **sin Base64**, manteniendo el perfil `oralsolutions`, target `dev`, esquema `BRONZE`, base y warehouse de la plantilla.
 
-**Ruta de montaje de Kestra:** `ENV_KESTRA_HOST_PROJECT_PATH` debe señalar la ruta absoluta del proyecto **visible para el motor Docker**; en Docker Desktop para Windows puede ser diferente de `C:\...`. Esta ruta se usa para montar `src/`, `data/raw/`, `dbt/`, `config/dbt/`, `spark/` y `.env` en las tareas temporales de Kestra.
+Ejemplo de ruta de montaje (adaptar al equipo):
 
-### 4. Construir y levantar la infraestructura
+```dotenv
+# Windows / Docker Desktop
+ENV_KESTRA_HOST_PROJECT_PATH=/run/desktop/mnt/host/c/Users/USUARIO/Desktop/proyecto_final
+# Linux (alternativa)
+# ENV_KESTRA_HOST_PROJECT_PATH=/home/usuario/proyecto_final
+```
 
-Desde `proyecto_final/`:
+Guardar `.env` en UTF-8 con saltos LF y asignaciones compatibles con shell, porque Spark lo carga desde Linux. No versionar `.env` ni `config/dbt/profiles.yml`. La ruta debe ser accesible desde el motor Docker para los contenedores temporales de Kestra.
+
+### 2. Construir y levantar la infraestructura
+
+Iniciar Docker y ejecutar desde la raíz:
 
 ```powershell
-# Validar la configuración de Docker Compose
 docker compose -p proyecto_final config --quiet
-
-# Construir las imágenes personalizadas (incluida dbt)
-docker compose -p proyecto_final build
-
-# Iniciar los servicios necesarios para el pipeline de datos
+docker compose -p proyecto_final build dbt
 docker compose -p proyecto_final up -d postgres kestra dbt spark
-
-# Comprobar los contenedores
 docker compose -p proyecto_final ps -a
-
-# Verificar la conexión de dbt con Snowflake
 docker compose -p proyecto_final exec dbt dbt debug
 ```
 
-La imagen utilizada por el subflujo dbt debe ser **`proyecto_final-dbt:latest`**, no la antigua `pset_2-dbt:latest`. El subflujo Spark utiliza `apache/spark:3.5.3`.
+Se utiliza el nombre Compose `proyecto_final` porque los flujos dependen de la red `proyecto_final_default` y de la imagen `proyecto_final-dbt:latest`. Spark utiliza `apache/spark:3.5.3`. `dbt debug` debe confirmar la conexión a Snowflake antes de continuar.
 
-### 5. Importar y ejecutar los flujos en Kestra
+### 3. Registrar y ejecutar los flujos ELT
 
-Abrir **http://localhost:8080**. Registrar o actualizar los YAML del directorio `kestra/` en el namespace `oralsolutions`:
+Abrir [Kestra](http://localhost:8080), iniciar sesión con las credenciales de `.env` y crear/importar los YAML de `kestra/` en el namespace `oralsolutions`, en este orden:
 
-1. `ingest_raw_oralsolutions.yml`: descarga/comprobación de archivos e ingesta idempotente a RAW, con procesamiento de 11 CSV.
-2. `test_dbt_docker.yml`: `dbt run` seguido de `dbt test`.
-3. `test_spark_docker.yml`: lectura de Gold, construcción y escritura de la OBT.
-4. `backfill_oralsolutions.yml`: recuperación histórica parametrizada.
-5. `ingesta.yml`: **flujo maestro**, con `id: flow_proyecto`.
+| Archivo | Flow ID | Función |
+|---|---|---|
+| `ingest_raw_oralsolutions.yml` | `ingest_raw_oralsolutions` | Descarga/verifica CSV y carga RAW. |
+| `test_dbt_docker.yml` | `test_dbt_docker` | Ejecuta modelos dbt y pruebas de calidad. |
+| `test_spark_docker.yml` | `test_spark_docker` | Construye OBT desde Gold. |
+| `backfill_oralsolutions.yml` | `backfill_oralsolutions` | Recuperación histórica opcional. |
+| `ingesta.yml` | `flow_proyecto` | Orquesta los tres subflujos principales. |
 
-Luego abrir **`oralsolutions.flow_proyecto`** y pulsar **Execute**. El flujo maestro invoca los tres subflujos principales en este orden:
-
-```text
-ingesta_raw                 → oralsolutions.ingest_raw_oralsolutions
-transformar_y_validar_dbt   → oralsolutions.test_dbt_docker
-construir_obt_spark         → oralsolutions.test_spark_docker
-```
-
-El maestro utiliza `wait: true` y `transmitFailed: true`: espera a que termine cada subflujo y propaga sus fallos. La tarea de ingesta contiene reintentos exponenciales configurados con `maxAttempts: 3` para la descarga de fuentes.
-
-El maestro incluye un trigger diario:
+Seleccionar `oralsolutions.flow_proyecto` → **Execute**. Esperar `Success` de los tres subflujos: ingesta RAW → transformación y validación dbt → construcción OBT. El flujo espera cada tarea y propaga fallos mediante `wait: true` y `transmitFailed: true`. La descarga de las fuentes dispone de reintentos exponenciales (`maxAttempts: 3`). La carga incorpora identificadores nuevos sin actualizar filas existentes. El trigger ELT se ejecuta diariamente a las 02:00 (`America/Guayaquil`); no corresponde a un trigger de inferencia MLOps.
 
 ```yaml
 cron: "0 2 * * *"
 timezone: America/Guayaquil
 ```
 
-Se ha verificado la **ejecución manual completa**; la activación efectiva del trigger programado aún requiere una prueba independiente.
+El procesamiento diario permite tener datos actualizados al comienzo de la jornada sin exigir streaming: el horizonte de decisión es de 60 días. La ejecución histórica del 23/11/2026 completó los tres subflujos en 6 min 2,10 s (tiempo de referencia, no garantía).
 
-### 6. Resultados verificados y operaciones opcionales
+### 4. Diagnóstico, limpieza y operaciones opcionales
 
-En la ejecución del **23 de noviembre de 2026**, el pipeline maestro `oralsolutions.flow_proyecto` terminó en **Success**, con sus **3 subflujos completados en 6 min 2,10 s**. Los componentes se probaron además por separado.
+Con los CSV disponibles, abrir `calidad/diagnostico_proyecto.ipynb` y ejecutar sus celdas con el kernel `.venv`. Analiza completitud, validez, precisión y consistencia sin modificar los archivos originales. La limpieza efectiva está implementada en los modelos dbt de Bronze y Silver, y se ejecuta automáticamente mediante el maestro.
 
-| Componente | Resultado comprobado |
-|---|---|
-| Fuentes RAW | 11 tablas, **38.603** registros |
-| Verificación de identificadores RAW | `COUNT(*) = COUNT(DISTINCT ID)` en las 11 tablas tras repetir la ingesta |
-| dbt Bronze | 11 tablas |
-| dbt Silver | 11 tablas |
-| dbt Gold | 5 dimensiones + 1 tabla de hechos |
-| Pruebas dbt | **177 PASS, 0 WARN, 0 ERROR, 0 SKIP** |
-| `GOLD.FACT_SESIONES_TRATAMIENTO` | **6.794** eventos |
-| Spark — joins dimensionales | **6.794** sesiones únicas conservadas |
-| `OBT.OBT_RIESGO_ABANDONO` | **3.435** puntos candidatos |
-| Citas repetidas por paciente-plan-cita | **0** |
-| Candidatos sin `CITA_ID` | **0** |
-| Flujo maestro Kestra | **Success**, 3/3 etapas |
-
-La **OBT se genera antes de definir la variable objetivo** `abandono_60d`. El corte temporal de observabilidad de 60 días y la preparación del dataset para entrenamiento forman parte de una etapa posterior; por ello, **3.435** filas de la OBT no deben confundirse con las **2.377** observaciones elegibles documentadas para modelado.
-
-El flujo de backfill también terminó en **Success** para las 11 fuentes en una ejecución parametrizada con fechas `2024-01-01` a `2025-12-31`. Esta prueba confirma que el proceso se completa sobre el histórico existente, **pero no demuestra por sí sola la recuperación de filas ausentes**. Esa prueba sigue pendiente en un entorno controlado.
-
-#### Comandos de operación
+Para ejecutar por separado las transformaciones o pruebas (no repetirlas si el maestro terminó correctamente):
 
 ```powershell
-# Ejecutar dbt manualmente dentro de su contenedor
+python calidad/limpiar.py
 docker compose -p proyecto_final exec dbt dbt run
 docker compose -p proyecto_final exec dbt dbt test
-
-# Ver estado de servicios
-docker compose -p proyecto_final ps -a
-
-# Detener los contenedores sin eliminar volúmenes
-docker compose -p proyecto_final down
 ```
 
-Para reconstruir la OBT se recomienda ejecutar **`oralsolutions.test_spark_docker`** desde Kestra, ya que esta tarea configura expresamente las variables de entorno, los conectores Maven y el volumen con `spark/job_spark.py`. No se recomienda ejecutar un `spark-submit` aislado sin reproducir esa configuración.
+`limpiar.py` ejecuta los modelos y pruebas de Silver. Para reconstruir únicamente la OBT, ejecutar `oralsolutions.test_spark_docker` en Kestra; configura los conectores Snowflake, Maven y los volúmenes necesarios para `spark/job_spark.py`.
 
-#### Validación rápida de la OBT en Snowsight
+Para recuperar datos históricos desde el stage, ejecutar `oralsolutions.backfill_oralsolutions` con:
+
+```yaml
+fuente: ALL
+fecha_inicio: "2024-01-01"
+fecha_fin: "2025-12-31"
+```
+
+También se puede seleccionar una sola fuente. El backfill inserta identificadores ausentes sin actualizar los existentes; los catálogos sin fecha no tienen filtro temporal y las líneas de tratamiento utilizan una fecha relacionada. Los registros sin fecha utilizable pueden quedar fuera del filtro. Ejecutar el maestro después de una recuperación efectiva para actualizar las capas posteriores. No eliminar registros para probar el backfill sobre el entorno consolidado. La ejecución histórica con `ALL` terminó en Success; por sí sola no acredita la recuperación de filas previamente ausentes.
+
+### 5. Verificar el resultado del pipeline
+
+| Salida en Snowflake | Resultado histórico de referencia |
+|---|---|
+| RAW | 11 tablas, 38.603 registros |
+| BRONZE | 11 modelos, 38.603 registros |
+| SILVER | 11 modelos, 38.603 registros |
+| GOLD | 6 tablas, 10.073 registros (6.794 eventos y 3.279 registros dimensionales) |
+| dbt | 28 modelos y 177 pruebas aprobadas, sin WARN/ERROR/SKIP |
+| `OBT.OBT_RIESGO_ABANDONO` | 3.435 puntos candidatos, 20 columnas |
+| Diagnóstico de calidad | 93,59 % de completitud inicial; 0 duplicados exactos |
+| Sesiones de Gold | 5.645 completadas, 704 canceladas, 445 inasistencias |
+| Consistencia temporal | 5 registros con 8 incumplimientos señalados en Silver |
+| Reintentos | 698 grupos, 1.396 eventos, 448 planes; ningún grupo con múltiples sesiones completadas |
+| Integración dimensional de Spark | 6.794 eventos únicos conservados antes de filtrar candidatos |
+
+Comprobar la OBT desde Snowsight:
 
 ```sql
-SELECT
-    COUNT(*) AS TOTAL_REGISTROS,
-    COUNT(DISTINCT SESION_KEY) AS SESIONES_UNICAS,
-    COUNT_IF(SESION_KEY IS NULL) AS CLAVES_NULAS
+SELECT COUNT(*) AS TOTAL,
+       COUNT(DISTINCT SESION_KEY) AS SESIONES_UNICAS,
+       COUNT_IF(SESION_KEY IS NULL) AS SESIONES_NULAS,
+       COUNT_IF(CITA_ID IS NULL) AS CITAS_NULAS,
+       COUNT_IF(NUMERO_SESION >= SESIONES_PLANIFICADAS) AS SIN_PENDIENTES
 FROM ORALSOLUTIONS_DW.OBT.OBT_RIESGO_ABANDONO;
 ```
 
-Para el dataset utilizado, se esperan **3.435 registros**, **3.435 sesiones únicas** y **0 claves nulas**.
-
-### Decisión de procesamiento: Batch vs. Streaming
-
-Se seleccionó **procesamiento por lotes (batch) diario**, con horario propuesto de **02:00 en `America/Guayaquil`**, porque el objetivo de negocio consiste en priorizar contactos, recordatorios y reprogramaciones ante el posible abandono durante un horizonte de 60 días. La decisión no requiere una respuesta de milisegundos ni una infraestructura de streaming continuo. Consolidar los registros durante la madrugada facilita que el personal disponga de información actualizada al comenzar la jornada, con una complejidad operativa menor.
-
-
+Resultado esperado: `3435, 3435, 0, 0, 0`. La OBT aún no contiene el target. La documentación detallada del pipeline está en [PSet2_memo_Tiban.pdf](docs/historial/PSet2_memo_Tiban.pdf).
 
 ## Cómo entrenar y evaluar el modelo
 
-Todos los comandos se ejecutan desde la raíz de `proyecto_final/`, con el entorno virtual activado. Esta etapa utiliza la OBT generada durante el PSet 2 y los componentes de modelado del PSet 3.
+### 1. Generar y verificar el dataset etiquetado
 
-### 1. Extracción desde Snowflake y generación del dataset (`src/datos.py`)
-
-El modelado parte de `ORALSOLUTIONS_DW.OBT.OBT_RIESGO_ABANDONO`, con **3.435 sesiones candidatas**, y consulta adicionalmente `GOLD.FACT_SESIONES_TRATAMIENTO` para identificar la continuidad real de cada tratamiento.
-
-El script utiliza las credenciales Snowflake de `.env`, identifica sesiones completadas posteriores dentro del mismo tratamiento y construye el target `abandono_60d`:
-
-- **0 (continuidad):** existe una sesión posterior completada dentro de 60 días.
-- **1 (abandono):** no existe continuidad registrada dentro de 60 días.
-
-Se excluyen las observaciones de los últimos 60 días del histórico (1.058 registros) para evitar censura a la derecha, así como las fechas inconsistentes. Las columnas auxiliares futuras se eliminan antes de guardar el dataset.
+Con la OBT, Gold y las credenciales disponibles, desde la raíz con `.venv` activo:
 
 ```powershell
 python -m src.datos
+python -m src.pipeline
+Get-FileHash .\data\processed\obt_riesgo_abandono.csv -Algorithm SHA256
 ```
 
-**Resultado verificado:** `data/processed/obt_riesgo_abandono.csv`, con **2.377 observaciones, 21 columnas, 321 abandonos (13,50 %) y 2.056 continuidades (86,50 %)**.
+`src/datos.py` consulta OBT y `GOLD.FACT_SESIONES_TRATAMIENTO`, construye `abandono_60d` (1: sin continuidad registrada dentro de 60 días; 0: con sesión posterior completada dentro del mismo horizonte y plan) y excluye 1.058 puntos sin horizonte completo. Guarda `data/processed/obt_riesgo_abandono.csv` con 2.377 observaciones, 21 columnas, 1.287 pacientes, 1.576 planes, 321 abandonos (13,50 %) y 2.056 continuidades (86,50 %). La escritura reemplaza el CSV local; conservar una copia si se necesita preservar la ejecución anterior.
 
-Huella del dataset:
+SHA-256 del CSV histórico:
 
 ```text
-SHA-256:
 11ae3cc53264511ef486f12d7a3fc0ddf2c6311e3ae7a8076f3c0cf046396dc1
 ```
 
-El script guarda directamente el CSV y calcula su huella SHA-256, sin generar respaldos automáticos. Si se modifica el dataset, deberán repetirse los experimentos y actualizarse las evidencias.
+`src/pipeline.py` verifica la preparación y división temporal:
 
-### 2. Preparación y división temporal (`src/pipeline.py`)
+| Conjunto | Período | Observaciones |
+|---|---|---:|
+| Entrenamiento | Hasta 2025-06-02 | 1.195 |
+| Separación excluida | 2025-06-03–2025-07-31 | 356 |
+| Hold-out | Desde 2025-08-01 | 826 |
 
-El pipeline carga el CSV, ordena las observaciones por `(fecha_realizada, sesion_key)` y aplica una división temporal con `FECHA_CORTE = 2025-08-01` y horizonte de maduración de 60 días.
+El pipeline usa 13 predictores (10 numéricos y 3 categóricos), 23 columnas transformadas y cinco pliegues temporales expansivos con purga de 60 días. El preprocesamiento aplica imputación, `RobustScaler` y `OneHotEncoder` ajustados en entrenamiento.
 
-| Conjunto | Período | Observaciones | Abandono |
-|---|---|---:|---:|
-| Entrenamiento | Hasta 2025-06-02 | 1.195 | 13,64 % |
-| Gap excluido | 2025-06-03 a 2025-07-31 | 356 | 11,24 % |
-| Hold-out | Desde 2025-08-01 | 826 | 14,29 % |
+| Variable derivada | Cálculo |
+|---|---|
+| `progreso_plan` | Número de sesión / sesiones planificadas. |
+| `ritmo_dias_por_sesion` | Días desde el inicio / número de sesión. |
+| `friccion_previa` | Cancelaciones e inasistencias acumuladas. |
+| `complejidad_proc` | Agrupación del procedimiento odontológico. |
 
-La separación temporal evita utilizar etiquetas que aún no habrían madurado al comenzar el período de evaluación.
+Las matrices transformadas esperadas son `(1195, 23)` y `(826, 23)`. Si el hash del CSV difiere, revisar la fuente y el entorno antes de asumir equivalencia. El monitoreo exige que el hash del dataset local coincida con el registrado para el modelo.
 
-Se construyen cuatro características derivadas:
-
-- `progreso_plan`: `numero_sesion / sesiones_planificadas`.
-- `ritmo_dias_por_sesion`: `dias_desde_inicio_plan / numero_sesion`.
-- `friccion_previa`: cancelaciones e inasistencias acumuladas.
-- `complejidad_proc`: agrupación del procedimiento odontológico.
-
-El modelo utiliza **13 predictores** (10 numéricos y 3 categóricos). Un `ColumnTransformer` integrado en un `Pipeline` aplica imputación por mediana y `RobustScaler` a numéricas, y moda más `OneHotEncoder` a categóricas, produciendo **23 columnas transformadas**. El preprocesador se ajusta exclusivamente con datos de entrenamiento.
-
-Verificar independientemente:
-
-```powershell
-python -m src.pipeline
-```
-
-**Resultado verificado:** 1.195 observaciones de entrenamiento, 826 de hold-out, 356 excluidas y matrices transformadas de `(1195, 23)` y `(826, 23)`.
-
-### 3. Levantar MLflow
-
-La experimentación utiliza MLflow 2.19.0 mediante Docker Compose, con almacenamiento persistente en el volumen `proyecto_final_datos_mlflow`.
-
-Desde `proyecto_final/`:
+### 2. Levantar MLflow y preparar el kernel
 
 ```powershell
 docker compose -p proyecto_final up -d mlflow
-
 docker compose -p proyecto_final ps mlflow
-
 docker compose -p proyecto_final logs --tail=30 mlflow
+python -m pip install ipykernel
+python -m ipykernel install --user --name oralsolutions --display-name "Python (OralSolutions)"
 ```
 
-Interfaz web: **http://localhost:5000**
+Abrir [MLflow](http://localhost:5000). El servidor usa MLflow 2.19.0 y el volumen `proyecto_final_datos_mlflow`. Los notebooks utilizan el experimento `OralSolutions`.
 
-Los notebooks utilizan el experimento `OralSolutions` y registran parámetros, métricas, etiquetas, artefactos y modelos. No es necesario eliminar las corridas anteriores para consultar o reutilizar los modelos existentes.
+Para una reproducción integral nueva, usar una instancia sin versiones previas de `oralsolutions-modelo` ni corridas previas que interfieran en la selección. El monitoreo y el notebook 06 requieren el champion v1. No borrar el volumen histórico; usar un entorno aislado. Una nueva corrida tendrá otro `run_id` aunque el entrenamiento sea equivalente.
 
-### 4. Orden de ejecución de los notebooks (`notebooks/`)
+### 3. Ejecutar los notebooks de modelado
 
-Seleccionar el kernel del entorno virtual `.venv` y ejecutar los notebooks en el siguiente orden. Todos reutilizan `src/pipeline.py`.
+Abrir desde VS Code/Jupyter, seleccionar el kernel `Python (OralSolutions)` o `.venv`, ejecutar **Restart Kernel → Run All** en cada notebook, en este orden, y guardar sus salidas. Si se quiere reproducir la comparación con Ollama, preparar primero el apartado 4 antes de ejecutar el notebook 03:
 
-1. **`01_eda.ipynb` — Análisis exploratorio:** distribución de clases, calidad del dataset, recurrencia de pacientes, valores atípicos, correlaciones de Spearman y hallazgos relevantes para el modelado.
+| Orden | Notebook | Función y salida de referencia |
+|---:|---|---|
+| 1 | `notebooks/01_eda.ipynb` | EDA: 2.377 observaciones, 13,50 % de abandono. |
+| 2 | `notebooks/02_features.ipynb` | Ingeniería de cuatro variables derivadas y ablación; 13 predictores finales. AP de LogisticRegression: 0,16795 (9 variables) y 0,16683 (13 variables). |
+| 3 | `notebooks/03_baseline_candidatos.ipynb` | Dummy Mayoritaria, Regla Negocio 14d, Regla 1 Sesión; LogisticRegression, RandomForest, HistGradientBoosting, MLPClassifier y GaussianNB. 8 corridas y `docs/resultados_modelos.csv`. |
+| 4 | `notebooks/04_tuning.ipynb` | `RandomizedSearchCV`, 30 configuraciones por cada una de tres familias, semilla 42; 93 corridas y `docs/resultados_tuning.csv`. |
+| 5 | `notebooks/05_seleccion.ipynb` | Comparación OOF, umbral por costo, hold-out final y registro de modelos; `docs/resultados_seleccion.csv` y `docs/corridas.csv`. |
 
-2. **`02_features.ipynb` — Ingeniería y evaluación de características:** analiza las cuatro variables derivadas mediante estadísticas descriptivas, correlaciones y pruebas de asociación. Incluye un estudio de ablación con LogisticRegression y cinco pliegues temporales purgados, comparando nueve variables originales frente a trece variables completas y cuatro configuraciones de eliminación individual. El modelo original obtuvo PR-AUC de 0,16795 frente a 0,16683 del modelo completo (diferencia de −0,00112), con mejoras en solo uno de cinco pliegues. No se demostró un aporte predictivo incremental conjunto de las variables derivadas para este algoritmo. La evaluación no utiliza el hold-out ni modifica MLflow.
+El EDA descriptivo usa el conjunto etiquetado completo; la ablación, selección y tuning se realizan con entrenamiento y validación temporal. El hold-out se utiliza para la evaluación final de ambos finalistas, aunque la exploración previa limita su independencia estricta. La ejecución histórica generó 102 corridas en el PSet3.
 
-3. **`03_baseline_candidatos.ipynb` — Líneas base y modelos candidatos:** compara tres líneas base (Dummy Mayoritaria, Regla de Negocio 14d y Regla 1 Sesión) y cinco candidatos (LogisticRegression, RandomForest, HistGradientBoosting, MLPClassifier y GaussianNB), mediante validación temporal purgada de cinco pliegues. Exporta `docs/resultados_modelos.csv`. Incluye una comparación exploratoria con un LLM local.
+No repetir los notebooks 03–05 únicamente para consultar modelos existentes: generan nuevas corridas y pueden cambiar alias, versiones y CSV. El fixture de pruebas es el artefacto histórico original; no sustituirlo por uno recién entrenado sin actualizar deliberadamente sus comprobaciones de identidad.
 
-4. **`04_tuning.ipynb` — Optimización de hiperparámetros:** ejecuta `RandomizedSearchCV` sobre MLPClassifier, HistGradientBoosting y LogisticRegression, con 30 configuraciones por familia, cinco pliegues temporales purgados y semilla 42. Registra 93 corridas de tuning en MLflow y exporta `docs/resultados_tuning.csv`.
+### 4. Comparación exploratoria con Ollama (opcional)
 
-5. **`05_seleccion.ipynb` — Selección y evaluación final:** compara los finalistas mediante predicciones fuera de pliegue (OOF), selecciona el umbral por costo de errores dentro del rango operativo permitido, evalúa una sola vez el hold-out y registra `@champion` y `@challenger` en MLflow Model Registry. Exporta `docs/resultados_seleccion.csv` y `docs/corridas.csv`.
+El notebook `notebooks/03_baseline_candidatos.ipynb` incluye una prueba real con `qwen2.5:0.5b`. No requiere una API de pago ni interviene en la selección del champion. Para reproducir también este experimento, preparar Ollama **antes de ejecutar el notebook 03**:
 
-**Importante:** el hold-out de 826 observaciones permanece reservado durante la comparación y optimización de modelos. La evaluación final se realiza en el notebook 05. Las ejecuciones de los notebooks 03–05 crean corridas y pueden registrar nuevas versiones, por lo que repetirlos modificará el historial de MLflow.
-
-**Interpretación del tuning:** Las configuraciones ajustadas incrementaron numéricamente la PR-AUC promedio de MLPClassifier (+0,0111), HistGradientBoosting (+0,0155) y LogisticRegression (+0,0161). Sin embargo, todas las diferencias fueron menores que las desviaciones estándar observadas entre los pliegues temporales. Por ello, el tuning se considera una exploración sistemática y reproducible de hiperparámetros, sin evidencia suficiente de mejoras robustas o estadísticamente significativas.
-
-### 5. Evaluación exploratoria con Ollama (opcional)
-
-El notebook `03_baseline_candidatos.ipynb` incluye una prueba real con el modelo local `qwen2.5:0.5b`. Esta comparación no interviene en la elección del champion.
-
-Instalar Ollama desde su sitio oficial y descargar el modelo:
+1. Instalar [Ollama](https://ollama.com/download) en el equipo local.
+2. Iniciar la aplicación. Si el servicio no está activo, ejecutar `ollama serve` en otra terminal y mantenerla abierta durante la prueba.
+3. Desde una terminal de PowerShell, descargar el modelo y comprobar el servicio:
 
 ```powershell
 ollama pull qwen2.5:0.5b
-
 ollama list
+Invoke-RestMethod -Uri "http://localhost:11434/api/tags"
 ```
 
-Comprobar que el servicio local esté disponible en `http://localhost:11434` y activar `EJECUTAR_OLLAMA = True` en la sección correspondiente del notebook 03.
+La lista debe incluir `qwen2.5:0.5b`. Si el puerto 11434 ya está ocupado por Ollama, no iniciar una segunda instancia. El notebook llama a `http://localhost:11434/api/generate`, por lo que debe ejecutarse en un kernel local que pueda acceder a ese servicio.
 
-**Resultado experimental:** 20 observaciones de validación, PR-AUC de 0,1833 para Ollama frente a 0,2416 para MLPClassifier, con latencia media de 2,91 segundos por caso. La comparación es exploratoria y no sustituye la validación cruzada temporal.
+4. Abrir `notebooks/03_baseline_candidatos.ipynb` y buscar la sección **6. Prueba opcional de un LLM local con Ollama**. Cambiar la opción de la celda de código:
 
-### 6. Resultados, trazabilidad y pruebas
+```python
+EJECUTAR_OLLAMA = True
+MODELO_OLLAMA = "qwen2.5:0.5b"
+```
 
-Los resultados se conservan en:
+5. Ejecutar el notebook desde el inicio (o, si las celdas anteriores ya se ejecutaron en el mismo kernel, ejecutar la sección 6). La prueba utiliza 20 observaciones del último pliegue de validación temporal y compara las respuestas del LLM con el candidato tabular sobre la misma muestra. Guardar las salidas.
 
-| Archivo | Contenido |
+| Indicador | Resultado histórico |
+|---|---:|
+| Observaciones | 20 |
+| Abandonos / continuidades | 4 / 16 |
+| AP Qwen | 0,1833 |
+| AP MLP sobre la misma muestra | 0,2416 |
+| Latencia media Qwen | 2,91 s/caso |
+
+La muestra tiene prevalencia modificada y no procede del hold-out; sus métricas son exploratorias. La latencia y las respuestas pueden variar. `EJECUTAR_OLLAMA = False` es la configuración por defecto y permite ejecutar el resto del proyecto sin Ollama. Si se desea conservar la evidencia histórica, no sobrescribir las salidas de esta sección con una ejecución desactivada; guardar una copia del notebook antes de repetirlo.
+
+### 5. Verificar resultados y artefactos de modelado
+
+| Archivo generado | Contenido |
 |---|---|
-| `docs/resultados_modelos.csv` | Líneas base y candidatos por defecto |
-| `docs/resultados_tuning.csv` | Configuraciones y métricas de tuning |
-| `docs/resultados_seleccion.csv` | Comparación final de champion y challenger |
-| `docs/corridas.csv` | Corridas, métricas e identificadores de MLflow |
+| `data/processed/obt_riesgo_abandono.csv` | Dataset etiquetado. |
+| `docs/resultados_modelos.csv` | Líneas base y candidatos por defecto. |
+| `docs/resultados_tuning.csv` | Resumen del ajuste de hiperparámetros. |
+| `docs/resultados_seleccion.csv` | Comparación de finalistas. |
+| `docs/corridas.csv` | Corridas, parámetros y métricas de MLflow. |
 
-La ejecución experimental definitiva registró **102 corridas activas**: 8 iniciales, 93 de tuning y una final.
-
-Para verificar el pipeline y la API sin depender de Snowflake ni del servidor MLflow se incluye un champion exportado en `tests/fixtures/modelo_champion/`, acompañado de su metadata y de una muestra fija de 826 observaciones.
+La ejecución original del PSet3 registró 102 corridas (8 iniciales, 3 padres y 90 hijas de tuning, 1 final); el export consolidado del PSet4 incorpora una corrida de reentrenamiento y contiene 103. Para comprobar la distribución por fase:
 
 ```powershell
-python -m pytest tests -v
+Import-Csv .\docs\corridas.csv |
+    Group-Object -Property 'tags.fase' |
+    Select-Object Name, Count
 ```
 
-**Resultado local verificado:** 14 pruebas aprobadas, 0 fallidas y 3 advertencias de dependencias, utilizando Python 3.14.6.
-
-Las pruebas cubren construcción de características, división temporal, preprocesamiento, contrato HTTP, reproducción de la PR-AUC, decisiones de negocio y funcionamiento del modo de respaldo.
-
+La decisión detallada se conserva en el memo del PSet3. Las pruebas locales se describen en «Cómo correr el servicio».
 
 ## Modelo final
 
-- **Champion:** Pipeline completo de scikit-learn con `HistGradientBoostingClassifier`, ajustado mediante `RandomizedSearchCV`.
-- **Model Registry:** `oralsolutions-modelo`, **versión 1**, alias `@champion`.
-- **Run ID:** `c90a1c37aef940278afc025b1d22dc6b`.
-- **Challenger:** `MLPClassifier`, **versión 2**, alias `@challenger`.
-- **Umbral operativo:** `0.01` (1 %), establecido como límite inferior para la selección por costos.
+El champion histórico y activo al cierre del PSet4 es un pipeline de scikit-learn con `HistGradientBoostingClassifier` ajustado mediante `RandomizedSearchCV`, registrado en MLflow como `oralsolutions-modelo`.
 
-### Métricas de selección y evaluación
+| Versión | Modelo | Estado histórico al cierre |
+|---:|---|---|
+| 1 | HistGradientBoosting | `@champion` |
+| 2 | MLPClassifier | Challenger original del PSet3 |
+| 3 | HistGradientBoosting reentrenado | `@challenger`, promoción rechazada |
 
-| Métrica | Champion (HGB) | Challenger (MLP) |
+- **Run ID del champion original:** `c90a1c37aef940278afc025b1d22dc6b`.
+- **Umbral:** 0,01.
+- **PR-AUC hold-out:** 0,159858 (826 observaciones).
+
+| Métrica de selección del PSet3 | Champion HGB v1 | Challenger histórico MLP v2 |
 |---|---:|---:|
-| PR-AUC CV temporal ajustada | 0,1852 ± 0,0597 | 0,1886 ± 0,0352 |
-| Costo estimado OOF (USD) | 3.459 | 5.019 |
-| PR-AUC hold-out | **0,159858** | 0,1666 |
+| AP CV temporal ajustada | 0,1852 ± 0,0597 | 0,1886 ± 0,0352 |
+| Costo OOF (USD) | 3.459 | 5.019 |
+| AP hold-out | 0,159858 | 0,166552 |
 | ROC-AUC hold-out | 0,5642 | 0,5619 |
 | Recall hold-out | 100 % | 96,61 % |
 | Precisión hold-out | 14,36 % | 15,00 % |
-| Costo de errores hold-out (USD) | **2.112** | 2.418 |
+| Costo de errores hold-out (USD) | 2.112 | 2.418 |
+| Inferencia local sobre las 826 observaciones (ms) | 10,0244 | 7,9572 |
 
+- **Criterio de selección:** menor costo OOF entre finalistas (USD 3.459 frente a USD 5.019 de MLP), aunque contactar a todos obtuvo USD 2.847 en OOF. En hold-out el champion obtuvo USD 2.112 frente a USD 2.124 de contactar a todos, una ventaja marginal que no demuestra superioridad económica robusta.
 
-**Criterio de selección:** HistGradientBoosting se seleccionó como champion experimental por registrar el menor costo de errores entre los modelos finalistas en validación temporal OOF: USD 3.459 frente a USD 5.019 de MLPClassifier. La comparación utilizó costos hipotéticos de USD 120 por falso negativo y USD 3 por falso positivo, con un umbral operativo mínimo de 0,01. Aunque MLPClassifier obtuvo una PR-AUC promedio ligeramente superior, las diferencias fueron pequeñas frente a la variabilidad entre pliegues.
+La justificación completa se encuentra en [PSet3_memo_Tiban.pdf](docs/historial/PSet3_memo_Tiban.pdf), junto con las [métricas de selección](docs/resultados_seleccion.csv) y las [corridas de MLflow](docs/corridas.csv).
 
-**Comparación con políticas simples:** En validación OOF, contactar a todos presentó un costo estimado de USD 2.847, inferior al de ambos modelos. Por tanto, el champion fue el mejor de los candidatos entrenados, pero no superó la política más simple durante la selección.
-
-En el hold-out de 826 observaciones, HistGradientBoosting obtuvo un costo de USD 2.112, frente a USD 2.124 de contactar a todos. El modelo emitió 822 alertas, evitando únicamente cuatro contactos. La ventaja de USD 12 fue mínima y contrastó con los resultados OOF.
-
-**Conclusión económica:** No existe evidencia suficiente para afirmar que el champion supera de forma robusta a la política de contactar a todos. Los resultados dependen de costos hipotéticos, una tasa de rescate supuesta del 35 % y datos sintéticos. Se conserva el modelo para fines experimentales y de despliegue del prototipo, no como demostración de superioridad clínica o económica.
-
-### Recuperación del modelo registrado
-
-Con MLflow activo, el champion puede recuperarse mediante:
+Para recuperar el modelo activo desde Python con MLflow levantado:
 
 ```python
 import mlflow
 import mlflow.sklearn
 
 mlflow.set_tracking_uri("http://localhost:5000")
-
-modelo = mlflow.sklearn.load_model(
-    "models:/oralsolutions-modelo@champion"
-)
+modelo = mlflow.sklearn.load_model("models:/oralsolutions-modelo@champion")
 ```
 
-El modelo registrado reproduce una **PR-AUC de 0,159858** sobre las 826 observaciones del hold-out corregido. Esta comprobación también se realiza mediante `tests/test_modelo.py` utilizando el artefacto local exportado.
-
-La API del PSet 4 consume el alias `@champion` y aplica el umbral de decisión de 0,01. El modelo y sus métricas deben interpretarse considerando el origen sintético del dataset, la capacidad discriminativa limitada y la ausencia de validación causal de las intervenciones.
-
-**Documentación y evidencias:** `docs/PSet3_memo_Tiban.pdf`, `docs/corridas.csv`, `docs/resultados_modelos.csv`, `docs/resultados_tuning.csv` y `docs/resultados_seleccion.csv`.
+Para recuperar una versión concreta, utilizar `models:/oralsolutions-modelo/1`. El run ID histórico no se mantiene al volver a entrenar; comprobar la identidad del registro utilizado en cada ejecución.
 
 ## Cómo correr el servicio
 
-El modelo seleccionado durante el PSet 3 (`oralsolutions-modelo`, **versión 1**, alias `@champion`, `run_id = c90a1c37aef940278afc025b1d22dc6b`, umbral operativo `u = 0.01`) se sirve mediante una API desarrollada en **FastAPI**, contenedorizada mediante `api/Dockerfile` y conectada al Model Registry de **MLflow** (`http://mlflow:5000`).
+El servicio está en `api/` (FastAPI), utiliza el alias `champion` de MLflow y persiste predicciones en Snowflake. El procesamiento batch diario posterior al ELT es la política operativa propuesta; el experimento ejecuta lotes históricos semanales mediante Kestra, sin trigger automático de inferencia diaria.
 
-La estrategia de despliegue seleccionada es el **procesamiento batch diario nocturno**, con horario operativo propuesto de **02:00 (`America/Guayaquil`)**, debido a que las predicciones apoyan la planificación de contactos preventivos y reprogramaciones, sin requerir respuestas en tiempo real.
+### 1. Inicializar MLOPS y levantar los contenedores
 
-FastAPI proporciona adicionalmente una interfaz de inferencia bajo demanda, utilizada por Kestra durante la simulación histórica y por el panel de recepción de Streamlit.
+Completar previamente el pipeline de datos y el registro del modelo. En Snowsight, ejecutar los SQL de `sql/mlops/` en orden, durante la preparación inicial, sin procesos concurrentes:
 
-La simulación del PSet 4 utiliza lotes semanales históricos para reproducir la evolución temporal del sistema. El procesamiento diario corresponde a la estrategia operativa propuesta, mientras que los lotes semanales corresponden al diseño experimental verificado.
-
-### 1. Preparar el almacenamiento de MLOps en Snowflake
-
-Además de los esquemas utilizados por el pipeline ELT, el sistema utiliza el esquema `ORALSOLUTIONS_DW.MLOPS` para almacenar las predicciones, métricas, alertas y evidencias de producción.
-
-Antes de ejecutar el servicio en un entorno nuevo, ejecutar en Snowsight los scripts SQL del directorio `sql/mlops/`, siguiendo su orden de numeración.
-
-| Tabla | Responsabilidad |
+| Archivo | Estructura creada o ampliada |
 |---|---|
-| `PREDICCIONES` | Predicciones individuales, entradas, decisiones y versiones del modelo |
-| `LOTES_PRODUCCION` | Control de ejecución y maduración de los lotes |
-| `MONITOREO` | Métricas supervisadas y costos de negocio |
-| `MONITOREO_INMEDIATO` | Métricas operativas, distribución y deriva |
-| `DERIVA_FEATURES` | PSI, pruebas estadísticas y calidad por variable |
-| `ALERTAS` | Alertas generadas durante el monitoreo |
-| `SOLICITUDES_HTTP` | Telemetría HTTP, latencias y errores |
-| `SNAP_SIM_2025_V1_OBT` | Snapshot de la OBT utilizada en la simulación |
-| `SNAP_SIM_2025_V1_GOLD` | Snapshot de la tabla de hechos utilizada para construir el target |
+| `01_crear_predicciones.sql` | MLOPS y `PREDICCIONES` |
+| `02_preparar_simulacion.sql` | Trazabilidad y `LOTES_PRODUCCION` |
+| `03_crear_monitoreo.sql` | `MONITOREO` |
+| `04_crear_monitoreo_inmediato.sql` | `MONITOREO_INMEDIATO`, `DERIVA_FEATURES`, `ALERTAS` |
+| `05_crear_telemetria_http.sql` | `SOLICITUDES_HTTP` y ampliación del monitoreo inmediato |
 
-Los snapshots se generan automáticamente durante la preparación de la simulación y permiten conservar las fuentes originales del experimento.
-
-Configurar adicionalmente en `.env`:
-
-```dotenv
-SF_MLOPS_SCHEMA=MLOPS
-ADMIN_TOKEN=<TOKEN_ADMINISTRATIVO_PRIVADO>
+```sql
+SHOW TABLES IN SCHEMA ORALSOLUTIONS_DW.MLOPS;
 ```
 
-El token administrativo protege el mecanismo de activación y desactivación del modo de respaldo. No debe incluirse en el repositorio.
+Deben existir siete tablas operativas. El simulador crea automáticamente los snapshots `SNAP_SIM_2025_V1_OBT` y `SNAP_SIM_2025_V1_GOLD` al preparar la primera simulación. El segundo SQL también actualiza predicciones con origen nulo; no repetir la inicialización sobre el histórico consolidado.
 
-Puede generarse mediante:
-
-```powershell
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-### 2. Levantar MLflow, FastAPI y Streamlit
-
-Desde la raíz de `proyecto_final/`, con las credenciales configuradas y el champion registrado previamente mediante el notebook `05_seleccion.ipynb`:
+Comprobar `.env`: `SF_MLOPS_SCHEMA=MLOPS`, `ADMIN_TOKEN` configurado, `MODO_RESPALDO=false`, `API_IMAGE=proyecto_final-api:latest`, `API_PULL_POLICY=build`.
 
 ```powershell
-# Levantar MLflow
 docker compose -p proyecto_final up -d mlflow
-
-# Levantar el servicio de predicción y el dashboard
-docker compose -p proyecto_final up -d api tablero
-
-# Comprobar el estado de los servicios
+docker compose -p proyecto_final up -d --build api tablero
 docker compose -p proyecto_final ps -a
-
-# Revisar los logs de FastAPI
-docker compose -p proyecto_final logs api --tail=50
+docker compose -p proyecto_final logs --tail=50 api
 ```
 
-Servicios disponibles:
+Kestra debe seguir activo. La API se construye con `api/Dockerfile`; Compose configura `REGISTRAR_SNOWFLAKE=true`, `USAR_MODELO_LOCAL=false` y `http://mlflow:5000` como dirección interna de MLflow. Los programas del host utilizan `http://localhost:5000` y `http://localhost:8000`.
 
-| Servicio | URL local |
+| Servicio | Dirección local |
 |---|---|
 | Kestra | http://localhost:8080 |
 | MLflow | http://localhost:5000 |
@@ -544,25 +554,23 @@ Servicios disponibles:
 | Swagger UI | http://localhost:8000/docs |
 | Streamlit | http://localhost:8501 |
 
-La API recupera el modelo mediante el alias:
+### 2. Verificar la API y realizar una predicción
 
-```text
-models:/oralsolutions-modelo@champion
-```
-
-Por tanto, el cambio de versión del modelo no requiere reconstruir la imagen Docker ni reiniciar el contenedor.
-
-Para verificar el estado del servicio:
+| Método | Endpoint | Función |
+|---|---|---|
+| GET | `/salud` | Disponibilidad del servicio. |
+| GET | `/modelo` | Identidad, versión, umbral y respaldo. |
+| POST | `/predecir` | Inferencia individual. |
+| GET | `/metricas` | Métricas operativas de la API. |
+| GET | `/alertas` | Alertas del servicio. |
+| POST | `/admin/respaldo` | Activación o desactivación administrativa protegida. |
 
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:8000/salud" |
-    ConvertTo-Json -Depth 5
-
-Invoke-RestMethod -Uri "http://localhost:8000/modelo" |
-    ConvertTo-Json -Depth 5
+Invoke-RestMethod -Uri "http://localhost:8000/salud"
+Invoke-RestMethod -Uri "http://localhost:8000/modelo"
 ```
 
-Respuesta verificada de `/modelo`:
+Respuesta histórica de referencia de `/modelo` (campos principales):
 
 ```json
 {
@@ -575,20 +583,14 @@ Respuesta verificada de `/modelo`:
 }
 ```
 
-En Linux o GitHub Codespaces se pueden utilizar:
+En una reproducción nueva el run ID diferirá del histórico. Para ejecutar desde Linux:
 
 ```bash
 curl -s http://localhost:8000/salud
 curl -s http://localhost:8000/modelo
 ```
 
-### 3. Ejemplo de petición y respuesta (`POST /predecir`)
-
-La API recibe nueve variables originales y reutiliza la lógica de ingeniería de características de `src/pipeline.py` para construir los trece predictores esperados por el modelo.
-
-El contrato de entrada se encuentra definido en `api/esquemas.py` mediante Pydantic e incluye validación estricta de tipos, rangos, categorías y coherencia entre sesiones.
-
-Ejemplo en PowerShell:
+Ejemplo de petición `POST /predecir`:
 
 ```powershell
 $payload = @{
@@ -602,550 +604,344 @@ $payload = @{
     codigo_procedimiento = "CROWN"
     odontologo_key = "2"
 }
-
-Invoke-RestMethod `
+$prediccion = Invoke-RestMethod `
     -Uri "http://localhost:8000/predecir" `
-    -Method Post `
-    -ContentType "application/json; charset=utf-8" `
-    -Body ($payload | ConvertTo-Json) |
-    ConvertTo-Json -Depth 5
+    -Method Post -ContentType "application/json; charset=utf-8" `
+    -Body ($payload | ConvertTo-Json)
+$prediccion | ConvertTo-Json -Depth 5
 ```
 
-Alternativamente, en Linux:
-
-```bash
-curl -X POST http://localhost:8000/predecir \
-    -H "Content-Type: application/json" \
-    -d '{
-        "duracion_estimada_min": 75,
-        "numero_sesion": 1,
-        "sesiones_planificadas": 3,
-        "cancelaciones_previas": 0,
-        "inasistencias_previas": 0,
-        "dias_desde_inicio_plan": 14,
-        "edad_en_atencion": 42,
-        "codigo_procedimiento": "CROWN",
-        "odontologo_key": "2"
-    }'
-```
-
-Respuesta verificada (`200 OK`):
+Respuesta histórica `HTTP 200` (ejemplo):
 
 ```json
 {
-    "id_prediccion": "4e4362de-c3c3-400e-8ef5-7da7ce6d006a",
-    "probabilidad": 0.09417587082633772,
-    "decision": "contactar",
-    "accion": "Priorizar recordatorio personalizado y seguimiento preventivo de recepción",
-    "umbral_aplicado": 0.01,
-    "version_modelo": "1",
-    "run_id": "c90a1c37aef940278afc025b1d22dc6b",
-    "uso_respaldo": false,
-    "latencia_ms": 298.493,
-    "timestamp": "2026-11-24T04:38:43.605423+00:00"
+  "id_prediccion": "4e4362de-c3c3-400e-8ef5-7da7ce6d006a",
+  "probabilidad": 0.09417587082633772,
+  "decision": "contactar",
+  "accion": "Priorizar recordatorio personalizado y seguimiento preventivo de recepción",
+  "umbral_aplicado": 0.01,
+  "version_modelo": "1",
+  "run_id": "c90a1c37aef940278afc025b1d22dc6b",
+  "uso_respaldo": false,
+  "latencia_ms": 298.493,
+  "timestamp": "2026-11-24T04:38:43.605423+00:00"
 }
 ```
 
-El identificador, la fecha y la latencia varían en cada solicitud.
+ID, timestamp, latencia y run ID (si se vuelve a entrenar) varían. Las entradas inválidas devuelven HTTP 422. En Linux también se puede usar Swagger UI para enviar el mismo JSON. La API valida nueve variables originales y construye los trece predictores con `src/pipeline.py`.
 
-Cuando la probabilidad estimada es igual o superior a `0.01`, el sistema devuelve la decisión `contactar`; en caso contrario, devuelve `no_contactar`.
+La predicción se registra en el CSV local de la API y, con persistencia habilitada, en `MLOPS.PREDICCIONES`. HTTP 200 no garantiza por sí solo la escritura en Snowflake; comprobar el ID de la respuesta y los logs si falta. Las solicitudes manuales no forman parte de L01–L08.
 
-Las entradas inválidas generan una respuesta HTTP `422` que identifica el campo que incumple el contrato.
+### 3. Ejecutar las pruebas automatizadas
 
-Con `REGISTRAR_SNOWFLAKE=true`, las predicciones se registran en `ORALSOLUTIONS_DW.MLOPS.PREDICCIONES`, incluyendo su identificador, entradas, probabilidad, decisión, versión del modelo, `run_id`, latencia y uso del respaldo.
-
-### 4. Ejecutar las pruebas automatizadas
-
-Desde `proyecto_final/`, con `.venv` activo y las dependencias instaladas:
+Desde la raíz, con `.venv` activo:
 
 ```powershell
-python -m pytest tests/ -v --tb=short
+python -m pytest tests -v --tb=short
 ```
 
-Las pruebas se organizan en:
+Resultado histórico: **28 pruebas aprobadas** en Python 3.14.6.
 
-| Archivo | Responsabilidad |
-|---|---|
-| `tests/test_pipeline.py` | Ingeniería de características, división temporal y ausencia de fuga |
-| `tests/test_contrato.py` | Validación del contrato HTTP y entradas inválidas |
-| `tests/test_modelo.py` | Reproducción de la métrica registrada en MLflow |
-| `tests/test_comportamiento.py` | Comportamiento de negocio, respaldo y retirada del modelo |
+| Archivo | Pruebas |
+|---|---:|
+| `tests/test_pipeline.py` | 4 |
+| `tests/test_contrato.py` | 14 |
+| `tests/test_comportamiento.py` | 9 |
+| `tests/test_modelo.py` | 1 |
+| **Total** | **28** |
 
-**Resultado local verificado: 28 pruebas aprobadas, 0 fallidas y 3 advertencias de dependencias.**
+No requieren Snowflake, Kestra ni MLflow: utilizan `tests/fixtures/modelo_champion/`, `modelo_meta.json` y `muestra_test.csv` (826 observaciones). La prueba del modelo reproduce AP = 0,159858 con tolerancia 0,0005. Si existe incompatibilidad de versiones, revisar los requisitos del fixture y `api/requirements.txt`.
 
-El modelo local de pruebas se encuentra en `tests/fixtures/modelo_champion/`, junto con una muestra fija de 826 observaciones y sus metadatos.
-
-La PR-AUC registrada en MLflow (`0.1598578375`) se reproduce mediante el modelo exportado, con una tolerancia absoluta de `0.0005`.
-
-Si se requiere actualizar el artefacto de pruebas desde el champion activo:
+Solo para actualizar deliberadamente el fixture, con dataset y MLflow disponibles:
 
 ```powershell
 python -m api.exportar_modelo
 ```
 
-Este comando descarga el modelo registrado, verifica el dataset, reproduce la métrica y actualiza los artefactos locales utilizados por CI.
+El exportador verifica la métrica y el dataset; no es necesario para ejecutar las pruebas existentes. Un modelo nuevo exige revisar las expectativas de identidad de las pruebas.
 
-No se requiere un servidor MLflow ni una conexión Snowflake para ejecutar las pruebas automatizadas con los fixtures existentes.
+### 4. Reproducir la simulación de producción y el monitoreo
 
-### 5. Versionado y rollback del modelo
+El histórico dispone de 14 lotes (826 observaciones); la entrega comprende L01–L08 (407 observaciones) de agosto a septiembre de 2025. En L07 y L08 se incrementan las cancelaciones e inasistencias previas en una unidad (respetando los límites del contrato), sin modificar las etiquetas ni los snapshots originales.
 
-MLflow Model Registry constituye la fuente de verdad para el versionado del modelo.
+| Lote | Período de 2025 | Observaciones | Maduración | Escenario |
+|---|---|---:|---|---|
+| L01 | 01–03 agosto | 12 | 02/10/2025 | Natural |
+| L02 | 04–10 agosto | 37 | 09/10/2025 | Natural |
+| L03 | 11–17 agosto | 53 | 16/10/2025 | Natural |
+| L04 | 18–24 agosto | 61 | 23/10/2025 | Natural |
+| L05 | 25–31 agosto | 54 | 30/10/2025 | Natural |
+| L06 | 01–07 septiembre | 68 | 06/11/2025 | Natural |
+| L07 | 08–14 septiembre | 59 | 13/11/2025 | Deriva inducida |
+| L08 | 15–21 septiembre | 63 | 20/11/2025 | Deriva inducida |
+| **Total** | | **407** | | |
 
-La API consulta el alias `@champion` y recupera la versión correspondiente cuando este cambia.
-
-Para reproducir la demostración de rollback con las versiones originales del PSet 3 y los servicios activos:
-
-```powershell
-python scripts/demostrar_rollback.py
-```
-
-La demostración verificada realizó la siguiente transición:
-
-```text
-Champion v1
-    ↓
-Cambio temporal del alias a v2
-    ↓
-Predicción utilizando v2
-    ↓
-Rollback a v1
-    ↓
-Recuperación de la predicción original
-```
-
-| Estado | Versión | Probabilidad |
-|---|---:|---:|
-| Champion inicial | 1 | 0.0941758708 |
-| Cambio temporal | 2 | 0.1032651291 |
-| Después del rollback | 1 | 0.0941758708 |
-
-Se comprobó que el identificador del contenedor, la imagen Docker y la fecha de inicio permanecieron sin cambios durante la demostración.
-
-Las tres predicciones quedaron registradas en Snowflake con su versión y `run_id` correspondiente.
-
-### 6. Simulación de producción por lotes
-
-La simulación utiliza las observaciones posteriores al corte temporal del entrenamiento original (`2025-08-01`), recuperadas desde Snowflake.
-
-Se verificó la equivalencia entre el dataset reconstruido desde Snowflake y el CSV utilizado en el PSet 3.
-
-El histórico de evaluación contiene 826 observaciones distribuidas en 14 lotes semanales. Para el experimento del PSet 4 se ejecutaron y evaluaron ocho lotes consecutivos, cumpliendo el mínimo requerido.
-
-| Lote | Período | Observaciones | Escenario |
-|---|---|---:|---|
-| L01 | 01/08/2025 – 03/08/2025 | 12 | Original |
-| L02 | 04/08/2025 – 10/08/2025 | 37 | Original |
-| L03 | 11/08/2025 – 17/08/2025 | 53 | Original |
-| L04 | 18/08/2025 – 24/08/2025 | 61 | Original |
-| L05 | 25/08/2025 – 31/08/2025 | 54 | Original |
-| L06 | 01/09/2025 – 07/09/2025 | 68 | Original |
-| L07 | 08/09/2025 – 14/09/2025 | 59 | Deriva inducida |
-| L08 | 15/09/2025 – 21/09/2025 | 63 | Deriva inducida |
-| **Total** | | **407** | |
-
-La deriva de datos se induce sobre `cancelaciones_previas` e `inasistencias_previas` y afecta consecuentemente a la característica derivada `friccion_previa`. Las etiquetas originales se conservan sin modificaciones.
-
-Los snapshots de la OBT y Gold permiten reproducir el experimento sin alterar las tablas originales del pipeline ELT.
-
-#### Ejecución mediante Kestra
-
-Registrar o actualizar los siguientes flujos en el namespace `oralsolutions.mlops`:
+En Kestra, importar los siguientes YAML desde `kestra/` al namespace `oralsolutions.mlops`:
 
 | Archivo | Flow ID |
 |---|---|
-| `kestra/produccion_lotes.yml` | `produccion_lotes` |
-| `kestra/monitoreo.yml` | `monitoreo` |
-| `kestra/reentrenamiento.yml` | `reentrenamiento` |
+| `monitoreo.yml` | `monitoreo` |
+| `produccion_lotes.yml` | `produccion_lotes` |
+| `simulacion_completa.yml` | `simulacion_completa` |
+| `reentrenamiento.yml` | `reentrenamiento` |
 
-Desde la interfaz de Kestra (`http://localhost:8080`), ejecutar `oralsolutions.mlops.produccion_lotes` indicando el número de lote.
+Comprobar que `/modelo` devuelve el champion v1 sin respaldo y que el CSV de modelado coincide con el hash registrado en MLflow. En `oralsolutions.mlops.produccion_lotes`, pulsar **Execute** con `lote: 1`; esperar `Success` y repetir para los lotes 2 a 8, en orden y sin ejecuciones paralelas. Cada flujo genera predicciones, registra telemetría e invoca el monitoreo inmediato y la evaluación de etiquetas maduras.
 
-El flujo realiza:
-
-1. Verificación de disponibilidad de FastAPI.
-2. Recuperación de observaciones desde Snowflake.
-3. Generación y persistencia de predicciones.
-4. Registro de telemetría HTTP.
-5. Invocación del flujo de monitoreo.
-
-Para reproducir la simulación experimental, ejecutar los lotes del 1 al 8 en orden cronológico.
-
-El simulador admite los 14 lotes definidos, aunque los resultados experimentales reportados corresponden exclusivamente a L01–L08.
-
-#### Ejecución manual alternativa
-
-```powershell
-# Validar las entradas de los 14 lotes sin generar predicciones
-python -m monitoreo.simular_produccion --verificar
-
-# Procesar el primer lote
-python -m monitoreo.simular_produccion --lote 1
-
-# Ejecutar el monitoreo inmediato
-python -m monitoreo.monitorear_lote --lote 1 --fecha-virtual 2025-08-03
-
-# Evaluar el lote una vez madurado su target
-python -m monitoreo.evaluar_lotes --fecha-virtual 2025-10-02
-```
-
-Los lotes completados no se vuelven a procesar al repetir la ejecución.
-
-La comprobación de idempotencia se realizó sobre L01, verificando que sus 12 predicciones permanecieran únicas.
-
-### 7. Monitoreo, deriva y alertas
-
-El monitoreo se realiza en dos momentos:
-
-- **Monitoreo inmediato:** distribución de entradas y predicciones, PSI, calidad de datos, volumen, latencias y errores HTTP.
-- **Monitoreo supervisado:** PR-AUC, precisión, recall, matriz de confusión y costos de negocio, una vez transcurrido el horizonte de 60 días.
-
-Para evaluar los ocho lotes pendientes desde Kestra, ejecutar `oralsolutions.mlops.monitoreo` con:
+Para reproducir la maduración histórica, ejecutar `oralsolutions.mlops.monitoreo` con `lote: 0` y `fecha_virtual: "2025-10-02"` (L01), y después con:
 
 ```yaml
 lote: 0
 fecha_virtual: "2025-11-20"
 ```
 
-Esta fecha permite evaluar todos los targets correspondientes a L01–L08.
+Esta última fecha permite evaluar todos los lotes L01–L08. El horizonte de maduración es de 60 días y el reloj es virtual. No se necesita esperar 60 días reales.
 
-Durante el experimento, L01 se evaluó el 2 de octubre de 2025 y los siete lotes restantes se evaluaron retrospectivamente el 20 de noviembre de 2025, respetando sus respectivas fechas de maduración.
+**Alternativa manual a Kestra** (elegir una modalidad, no ambas), desde la raíz:
 
-#### Umbrales de monitoreo
+```powershell
+$env:API_URL = "http://127.0.0.1:8000"
+$env:MLFLOW_TRACKING_URI = "http://127.0.0.1:5000"
+foreach ($lote in 1..8) {
+    python -m monitoreo.simular_produccion --lote $lote
+    if ($LASTEXITCODE -ne 0) { throw "Error en lote $lote" }
+    python -m monitoreo.orquestar_monitoreo --lote $lote
+    if ($LASTEXITCODE -ne 0) { throw "Error de monitoreo en lote $lote" }
+}
+python -m monitoreo.orquestar_monitoreo --lote 0 --fecha-virtual 2025-10-02
+if ($LASTEXITCODE -ne 0) { throw "Error al evaluar L01" }
+python -m monitoreo.orquestar_monitoreo --lote 0 --fecha-virtual 2025-11-20
+```
+
+Con los snapshots creados, `python -m monitoreo.simular_produccion --verificar` valida las entradas de los 14 lotes sin generar predicciones. El flujo opcional `simulacion_completa` procesa L04–L14 y avanza el reloj hasta 2026-01-01; presupone L01–L03 completados. No es necesario ejecutarlo para reproducir la entrega de ocho lotes. Los lotes completos no se vuelven a predecir; los incompletos requieren reconciliar registros antes de reintentarlos. El monitoreo puede actualizar resultados existentes.
+
+### 5. Consultar monitoreo y tablero
+
+Abrir [Streamlit](http://localhost:8501) (si no está activo, `docker compose -p proyecto_final up -d tablero`). El tablero muestra métricas inmediatas, supervisadas, deriva, alertas, costos y reentrenamientos; también dispone de un panel de recepción para inferencia bajo demanda. Utilizar «Actualizar datos» para refrescar las consultas.
+
+El monitoreo inmediato revisa calidad, deriva y latencias; el supervisado calcula desempeño y costos con etiquetas maduras. El monitoreo compara los 13 predictores con las 1.195 observaciones originales de entrenamiento.
+
+| Módulo | Función |
+|---|---|
+| `monitoreo/monitorear_lote.py` | Calidad, deriva y monitoreo inmediato. |
+| `monitoreo/evaluar_lotes.py` | Evaluación de lotes maduros. |
+| `monitoreo/orquestar_monitoreo.py` | Coordina ambos momentos y actualiza alertas supervisadas. |
+| `monitoreo/deriva.py` | PSI, KS y chi-cuadrado. |
+| `monitoreo/alertas.py` | Reglas operativas. |
 
 | Indicador | Umbral | Severidad |
 |---|---|---|
-| PSI moderado | 0.10 ≤ PSI < 0.25 | Media |
-| PSI significativo | PSI ≥ 0.25 | Alta |
-| PR-AUC | Inferior a 0.125553 | Deterioro supervisado |
-| Latencia HTTP p95 | Superior a 250 ms | Media |
-| Valores fuera del rango de entrenamiento | Superior al 5 % | Media |
+| PSI | ≥ 0,10 y < 0,25 | Media |
+| PSI | ≥ 0,25 | Alta |
+| AP (1 lote maduro) | < 0,125553 | Alta |
+| AP (1 lote maduro) | < 0,065884 | Crítica |
+| Faltantes | > 5 % | Media |
+| Fuera del rango de entrenamiento | > 5 % | Media |
+| Categorías no vistas | > 0 % | Media |
+| Errores HTTP | > 5 % | Alta |
+| Latencia HTTP p95 | > 250 ms | Media |
 
-El umbral de deterioro supervisado corresponde a la PR-AUC promedio de validación cruzada del champion menos una desviación estándar:
+Los umbrales AP se calculan a partir de la media CV menos una o dos desviaciones estándar, respectivamente; la condición crítica tiene prioridad. El PSI se complementa con KS y chi-cuadrado según el tipo de variable. Las alertas no disparan automáticamente el reentrenamiento ni la retirada.
 
-```text
-0.1852225492 - 0.0596693412 = 0.1255532080
+Verificar los resultados en Snowsight:
+
+```sql
+SELECT * FROM ORALSOLUTIONS_DW.MLOPS.LOTES_PRODUCCION
+WHERE SIMULACION_ID = 'SIM_2025_V1' AND LOTE_ID BETWEEN 'L01' AND 'L08'
+ORDER BY LOTE_ID;
+
+SELECT LOTE_ID, PR_AUC, PRECISION, RECALL, COSTO_MODELO_USD, COSTO_LLAMAR_TODOS_USD
+FROM ORALSOLUTIONS_DW.MLOPS.MONITOREO
+WHERE SIMULACION_ID = 'SIM_2025_V1' AND LOTE_ID BETWEEN 'L01' AND 'L08'
+ORDER BY LOTE_ID;
+
+SELECT CODIGO, SEVERIDAD, COUNT(*) AS TOTAL
+FROM ORALSOLUTIONS_DW.MLOPS.ALERTAS
+WHERE SIMULACION_ID = 'SIM_2025_V1' AND LOTE_ID BETWEEN 'L01' AND 'L08'
+GROUP BY CODIGO, SEVERIDAD
+ORDER BY CODIGO, SEVERIDAD;
 ```
 
-El PSI se complementa con pruebas Kolmogorov-Smirnov para variables numéricas y Chi-cuadrado para variables categóricas, considerando las limitaciones de tamaño muestral y los supuestos de las pruebas.
+Referencia histórica: 8 lotes evaluados, 407 predicciones, 104 registros de deriva y 16 alertas inmediatas (sin alertas supervisadas). L01 no tiene telemetría HTTP histórica; L02–L08 registraron 395 solicitudes sin errores HTTP ni de transporte. Una reproducción con el código actual puede registrar telemetría también en L01. La latencia p95 histórica superó 250 ms; no se garantiza repetir las mismas latencias o alertas. L07 y L08 alcanzaron PSI máximos de 16,579669 y 16,417947; también hubo alertas en los seis lotes naturales (cinco altas y una media). Ningún lote cayó por debajo del umbral AP de referencia.
 
-#### Resultados verificados
+### 6. Demostrar rollback y respaldo (opcional para operar el servicio)
 
-| Lote | PR-AUC | PSI máximo | Recall |
-|---|---:|---:|---:|
-| L01 | 0.1833 | 3.6239 | 100 % |
-| L02 | 0.1398 | 2.3312 | 100 % |
-| L03 | 0.3427 | 0.3090 | 100 % |
-| L04 | 0.1478 | 0.1022 | 100 % |
-| L05 | 0.1403 | 0.3093 | 100 % |
-| L06 | 0.1718 | 0.3259 | 100 % |
-| L07 | 0.5185 | 16.5797 | 100 % |
-| L08 | 0.1641 | 16.4179 | 100 % |
-
-Se registraron **16 alertas**, incluyendo la detección de deriva inducida en L07 y L08.
-
-Ninguno de los ocho lotes presentó una PR-AUC inferior al umbral de deterioro establecido. Por tanto, se observó deriva de datos sin evidencia de deterioro supervisado según el criterio implementado.
-
-También se generaron alertas en lotes no alterados, asociadas a cambios naturales de distribución y a la sensibilidad del PSI ante muestras pequeñas.
-
-La latencia HTTP p95 superó los 250 ms en los siete lotes con telemetría disponible. Esto representa una limitación operativa del prototipo, aunque resulta menos restrictiva bajo el patrón de procesamiento batch seleccionado.
-
-L01 no dispone de telemetría HTTP histórica debido a que fue procesado antes de incorporar esta funcionalidad. Sus valores permanecen nulos.
-
-### 8. Dashboard interactivo
-
-El dashboard se encuentra implementado en `monitoreo/tablero.py` mediante Streamlit y consulta directamente Snowflake, FastAPI y MLflow.
-
-Para iniciarlo:
+Realizar las demostraciones en un entorno controlado sin simulaciones concurrentes. Para reproducir la secuencia histórica de rollback, ejecutarlo antes del reentrenamiento, con champion v1 y challenger v2:
 
 ```powershell
-docker compose -p proyecto_final up -d tablero
+python scripts/demostrar_rollback.py
+Invoke-RestMethod -Uri "http://localhost:8000/modelo"
 ```
 
-Acceder a:
+El script cambia temporalmente los alias, comprueba el nuevo modelo y restaura el anterior. La demostración histórica v1 → v2 → v1 recuperó la predicción original sin reconstruir la imagen ni reiniciar el contenedor:
 
-http://localhost:8501
+| Etapa | Versión | Probabilidad |
+|---|---:|---:|
+| Champion inicial | 1 | 0,0941758708 |
+| Cambio temporal | 2 | 0,1032651291 |
+| Después del rollback | 1 | 0,0941758708 |
 
-El tablero incluye:
+Si ya existe el challenger v3, la prueba utilizará los alias vigentes; no será la misma transición histórica. Comprobar que se restauró el champion original.
 
-- Estado del servicio y versión activa del modelo.
-- Volumen de predicciones y estado de los lotes.
-- Evolución de PR-AUC y recall.
-- PSI por lote y variable.
-- Identificación de escenarios con deriva inducida.
-- Métricas de calidad de datos y telemetría HTTP.
-- Alertas generadas.
-- Comparación económica entre estrategias.
-- Resultados y decisiones de reentrenamiento.
-- Panel de recepción para inferencia bajo demanda.
+El respaldo se activa automáticamente ante fallos de carga del modelo o manualmente mediante `POST /admin/respaldo`. Con el payload definido en el paso 2, probar el respaldo y restaurarlo al terminar, incluso si falla una comprobación:
 
-La ejecución verificada recuperó ocho lotes evaluados, 407 predicciones, recall agregado del 100 %, precisión agregada del 14,2 % y 16 alertas.
-
-### 9. Reentrenamiento y gobernanza del modelo
-
-El reentrenamiento se implementa en `src/reentrenar.py` y se orquesta mediante `kestra/reentrenamiento.yml`.
-
-Como no se observó deterioro supervisado durante los ocho lotes, se utilizó una **revisión por calendario** como disparador del ciclo experimental, en lugar de reentrenar únicamente por la presencia de deriva de datos.
-
-El proceso reutiliza `src/pipeline.py`, los hiperparámetros del champion y los snapshots originales, sin incorporar las alteraciones artificiales de L07 y L08.
-
-Para reproducir el ciclo, ejecutar en Kestra:
-
-```text
-oralsolutions.mlops.reentrenamiento
+```powershell
+$adminToken = (docker compose -p proyecto_final exec -T api python -c "import os; print(os.getenv('ADMIN_TOKEN', ''))").Trim()
+$headers = @{ "x-admin-token" = $adminToken }
+$uri = "http://localhost:8000/admin/respaldo"
+try {
+    Invoke-RestMethod -Uri $uri -Method Post -Headers $headers `
+        -ContentType "application/json" `
+        -Body (@{ activar = $true; motivo = "Revision temporal" } | ConvertTo-Json)
+    Invoke-RestMethod -Uri "http://localhost:8000/alertas"
+    foreach ($sesion in 1..2) {
+        $payload.numero_sesion = $sesion
+        Invoke-RestMethod -Uri "http://localhost:8000/predecir" `
+            -Method Post -ContentType "application/json" `
+            -Body ($payload | ConvertTo-Json)
+    }
+} finally {
+    Invoke-RestMethod -Uri $uri -Method Post -Headers $headers `
+        -ContentType "application/json" `
+        -Body (@{ activar = $false; motivo = "Fin de revision" } | ConvertTo-Json)
+    $payload.numero_sesion = 1
+    Remove-Variable adminToken, headers
+}
+Invoke-RestMethod -Uri "http://localhost:8000/modelo"
 ```
 
-Con el parámetro:
+Resultado esperado: sesión 1 de 3 → puntuación 0,13, `no_contactar`; sesión 2 de 3 → 0,99, `contactar`. El umbral de respaldo es 0,50 y sus puntuaciones son heurísticas. Las respuestas indican `uso_respaldo=true`; al restaurar, el modelo debe volver a estar disponible y `modo_respaldo=false`.
+
+### 7. Ejecutar el reentrenamiento
+
+Con los snapshots históricos existentes, champion v1 y MLflow activo, abrir `oralsolutions.mlops.reentrenamiento` en Kestra y ejecutar con:
 
 ```yaml
 fecha_virtual: "2026-01-01"
 ```
 
-El flujo ejecuta tres tareas:
+El flujo entrena un challenger, registra métricas en `OralSolutions_Reentrenamiento` y se pausa en `pausa_aprobacion_humana`. Revisar los logs y las métricas; reanudar con `decision_humana` (`aprobar` o `rechazar`) y `motivo_decision`. Para la ejecución histórica se seleccionó `rechazar` porque el costo aumentó de USD 195 a USD 198. El flujo comprueba de nuevo la regla técnica y económica antes de promover. No se requiere ejecutar L09–L14 mediante FastAPI.
 
-1. `entrenar_challenger`: entrenamiento, evaluación comparativa y registro en MLflow.
-2. `pausa_aprobacion_humana`: revisión manual de las métricas.
-3. `aplicar_decision_promocion`: aplicación y registro de la decisión.
-
-#### Configuración experimental
-
-| Parámetro | Valor |
-|---|---|
-| Disparador | Revisión por calendario |
-| Fecha virtual | 2026-01-01 |
-| Observaciones de entrenamiento | 1.745 |
-| Límite de entrenamiento | 2025-08-27 |
-| Separación temporal | 60 días |
-| Lote de evaluación | L14 |
-| Observaciones de evaluación | 81 |
-| Algoritmo | HistGradientBoostingClassifier |
-| Umbral operativo | 0.01 |
-
-El challenger se compara con el champion sobre el mismo conjunto de evaluación.
-
-L14 no se utiliza para entrenar el challenger. Sin embargo, formó parte del hold-out original del PSet 3, por lo que esta comparación retrospectiva no constituye una validación externa completamente independiente.
-
-#### Regla de promoción
-
-El nuevo modelo únicamente puede promoverse cuando:
-
-- Su costo estimado de errores es inferior al del champion.
-- Su PR-AUC no es inferior a la del champion menos la tolerancia de validación cruzada.
-- Existe una aprobación humana explícita.
-
-#### Resultado verificado
-
-| Métrica | Champion v1 | Nuevo challenger |
+| Indicador de L14 | Champion v1 | Challenger v3 histórico |
 |---|---:|---:|
-| PR-AUC | 0.327545 | 0.378327 |
-| Precisión | 18.75 % | 18.52 % |
+| Observaciones de evaluación | 81 | 81 |
+| PR-AUC | 0,327545 | 0,378327 |
 | Recall | 100 % | 100 % |
+| Precisión | 18,75 % | 18,52 % |
 | Falsos positivos | 65 | 66 |
 | Falsos negativos | 0 | 0 |
-| Tasa de contacto | 98.77 % | 100 % |
-| Costo estimado de errores | USD 195 | USD 198 |
+| Costo de errores (USD) | 195 | 198 |
 
-**Decisión: rechazar la promoción del challenger.**
+El challenger se entrenó con 1.745 observaciones hasta 2025-08-27. La promoción exige menor costo, AP no inferior a la del champion menos la desviación estándar CV de referencia (0,05967) y aprobación humana. Se mantuvo v1. La revisión por calendario virtual se activa explícitamente; no existe trigger automático por deterioro. El reentrenamiento usa datos originales, no los payloads alterados de L07–L08, y L14 pertenece al hold-out original.
 
-Aunque el nuevo modelo mejora la PR-AUC, incrementa el costo estimado de errores y no reduce la carga administrativa. Por tanto, no satisface el criterio económico de promoción.
-
-La ejecución de Kestra finalizó en `Success`, con sus tres tareas completadas y la decisión humana registrada.
-
-Se verificó mediante `/modelo` que FastAPI conservó el champion v1.
-
-Las corridas de esta fase se almacenan en el experimento `OralSolutions_Reentrenamiento` de MLflow.
-
-### 10. Retirada del modelo y modo de respaldo
-
-La API dispone de un mecanismo de respaldo basado en una regla de negocio, que permite mantener el servicio operativo cuando el modelo no está disponible o debe retirarse temporalmente.
-
-El mecanismo puede activarse mediante el endpoint administrativo protegido:
-
-```text
-POST /admin/respaldo
-```
-
-Ejemplo en PowerShell:
+Alternativa manual (en lugar de Kestra):
 
 ```powershell
-# Recuperar el token sin mostrarlo en consola
-$adminToken = (
-    docker compose exec -T api python -c "import os; print(os.getenv('ADMIN_TOKEN', ''))"
-).Trim()
-
-$headers = @{
-    "x-admin-token" = $adminToken
-}
-
-# Activar el modo de respaldo
-Invoke-RestMethod `
-    -Uri "http://localhost:8000/admin/respaldo" `
-    -Method Post `
-    -Headers $headers `
-    -ContentType "application/json; charset=utf-8" `
-    -Body (@{
-        activar = $true
-        motivo = "Retirada temporal para revision"
-    } | ConvertTo-Json)
+python -m src.reentrenar entrenar --fecha-virtual 2026-01-01
 ```
 
-Para verificar el estado:
+Recuperar el run ID emitido, revisar sus métricas y registrar la decisión real. Ejemplo histórico:
 
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:8000/salud"
-
-Invoke-RestMethod -Uri "http://localhost:8000/alertas"
+python -m src.reentrenar decidir --run-id "<RUN_ID_GENERADO>" --decision rechazar --motivo "No reduce el costo de errores"
 ```
 
-Para restaurar el modelo:
+Después de cualquiera de las modalidades, exportar las corridas (Kestra no lo hace por sí solo):
 
 ```powershell
-Invoke-RestMethod `
-    -Uri "http://localhost:8000/admin/respaldo" `
-    -Method Post `
-    -Headers $headers `
-    -ContentType "application/json; charset=utf-8" `
-    -Body (@{
-        activar = $false
-        motivo = "Fin de la revision"
-    } | ConvertTo-Json)
-```
-
-Se verificaron el rechazo de solicitudes administrativas sin autorización, la activación del respaldo, la generación de predicciones mediante la regla de negocio y la restauración del champion.
-
-Las predicciones realizadas en respaldo se identifican mediante:
-
-```json
-{
-    "version_modelo": "fallback-regla-1-sesion",
-    "run_id": "fallback",
-    "uso_respaldo": true
-}
-```
-
-Las puntuaciones asignadas por el respaldo corresponden a una regla operativa y no deben interpretarse como probabilidades calibradas.
-
-Las decisiones de contacto constituyen recomendaciones administrativas sujetas a supervisión humana y no sustituyen decisiones clínicas.
-
-### 11. Integración y entrega continua (CI/CD)
-
-El repositorio utiliza GitHub Actions mediante:
-
-| Archivo | Responsabilidad |
-|---|---|
-| `.github/workflows/ci.yml` | Instalación de dependencias, pruebas automatizadas y construcción de la imagen |
-| `.github/workflows/cd.yml` | Validación previa y publicación de la imagen en GHCR |
-
-CI se ejecuta ante los eventos configurados de `push` y `pull_request`. CD publica la imagen ante un `push` a la rama `main`, después de superar las pruebas automatizadas.
-
-Las imágenes se publican en:
-
-```text
-ghcr.io/satiban/oralsolutions-api
-```
-
-Cada publicación utiliza dos etiquetas:
-
-- Hash completo del commit.
-- `latest`.
-
-La imagen publicada y verificada durante el PSet 4 corresponde a:
-
-```text
-ghcr.io/satiban/oralsolutions-api:fe1fdcb0108994682d30f876becd8b9ff3804936
-```
-
-Con Docker Compose configurado para utilizar la etiqueta publicada:
-
-```powershell
-docker compose -p proyecto_final pull api
-
-docker compose -p proyecto_final up -d --no-deps --no-build api
-
-docker compose -p proyecto_final images api
-```
-
-Verificar posteriormente:
-
-```powershell
-Invoke-RestMethod -Uri "http://localhost:8000/salud"
-
+python -m src.reentrenar exportar
 Invoke-RestMethod -Uri "http://localhost:8000/modelo"
 ```
 
-Se comprobó la ejecución exitosa de los workflows de CI y CD, la publicación en GHCR, la descarga de la imagen y su funcionamiento mediante Docker Compose.
+Se actualizan `docs/corridas.csv` y `docs/reentrenamientos.csv`. Repetir el entrenamiento genera nuevas corridas, versiones y alias; no hacerlo solo para consultar evidencias. El monitoreo actual no reconstruye la referencia de modelos promovidos posteriores a v1.
 
-La publicación del código de la API se automatiza mediante CD. En cambio, la promoción de modelos permanece separada y requiere cumplir las reglas de evaluación y aprobación humana.
+### 8. Integración y entrega continua (CI/CD)
 
-### 12. Notebooks de producción y análisis final
+`.github/workflows/ci.yml` ejecuta pruebas y build en los eventos configurados de push y pull request; `cd.yml` valida las pruebas y publica en GHCR al hacer push a `main`. Consultar el estado en la pestaña **Actions** de GitHub.
 
-Una vez completada la simulación, el monitoreo y el ciclo de reentrenamiento, ejecutar los notebooks restantes en el siguiente orden, utilizando el kernel de `.venv`:
+La imagen histórica verificada es `ghcr.io/satiban/oralsolutions-api:fe1fdcb0108994682d30f876becd8b9ff3804936`. Para descargar una imagen publicada en vez de construir localmente, configurar `.env`:
 
-1. **`06_simulacion_produccion.ipynb`:** consulta los lotes, predicciones, maduración de targets, trazabilidad y telemetría HTTP almacenados en Snowflake.
-2. **`07_analisis_monitoreo.ipynb`:** analiza desempeño, deriva, alertas, costos, equidad, condiciones de retirada y resultados del reentrenamiento.
+```dotenv
+API_IMAGE=ghcr.io/satiban/oralsolutions-api:latest
+API_PULL_POLICY=always
+```
 
-Ambos notebooks deben ejecutarse mediante `Restart Kernel → Run All` y guardarse con sus salidas visibles.
+Usar la etiqueta por SHA para una versión concreta; si el paquete es privado, autenticarse en GHCR con una cuenta autorizada. En un fork, utilizar el nombre del paquete publicado por ese propietario.
 
-Estos notebooks consultan y exportan resultados existentes. No vuelven a ejecutar las predicciones ni generan nuevas versiones del modelo.
+```powershell
+docker compose -p proyecto_final pull api
+docker compose -p proyecto_final up -d --no-deps --no-build api
+docker compose -p proyecto_final images api
+Invoke-RestMethod -Uri "http://localhost:8000/salud"
+Invoke-RestMethod -Uri "http://localhost:8000/modelo"
+```
 
-### 13. Resultados de negocio en producción simulada
+Para regresar al build local, restaurar `API_IMAGE=proyecto_final-api:latest`, `API_PULL_POLICY=build` y ejecutar `docker compose -p proyecto_final up -d --build api`. Publicar una imagen no actualiza automáticamente el contenedor local ni promueve modelos.
 
-Los ocho lotes evaluados contienen 407 observaciones, de las cuales 57 corresponden a abandono.
+### 9. Ejecutar notebooks finales y verificar evidencias
 
-El champion identificó los 57 abandonos, sin falsos negativos, pero recomendó contactar a 401 observaciones.
+Con los ocho lotes evaluados y el reentrenamiento concluido, ejecutar en orden con el kernel `.venv`, mediante Restart Kernel → Run All:
+
+| Notebook | Salida |
+|---|---|
+| `notebooks/06_simulacion_produccion.ipynb` | Consulta y exporta lotes, predicciones, telemetría y demostraciones. |
+| `notebooks/07_analisis_monitoreo.ipynb` | Consulta y exporta monitoreo, deriva, alertas, equidad, costos y reentrenamiento. |
+
+Guardar sus salidas. No vuelven a entrenar ni a generar predicciones, pero pueden sobrescribir los CSV; conservar las evidencias históricas antes de experimentar nuevamente.
+
+Para regenerar `predicciones_demostracion.csv`, el notebook 06 filtra `ORIGEN='demostracion'`. Las nuevas solicitudes manuales inicialmente tienen origen nulo. Si se necesita exportarlas, verificar sus UUID en Snowflake y clasificar exclusivamente los registros de demostración identificados, nunca los de lotes ni los incompletos. Ejemplo controlado, sin procesos concurrentes:
+
+```sql
+UPDATE ORALSOLUTIONS_DW.MLOPS.PREDICCIONES
+SET ORIGEN = 'demostracion', DERIVA_INDUCIDA = FALSE
+WHERE ID_PREDICCION = '<UUID_DE_DEMOSTRACION_VERIFICADO>'
+  AND ORIGEN IS NULL AND LOTE_ID IS NULL AND SIMULACION_ID IS NULL;
+```
+
+No ejecutar esa actualización para consultar las evidencias históricas ya entregadas.
+
+Resultados de referencia de L01–L08: 407 predicciones, 57 abandonos, 401 recomendaciones de contacto, recall 100 %, precisión 14,21 %. La matriz acumulada contiene 57 VP, 344 FP, 0 FN y 6 VN.
 
 | Estrategia | Costo estimado de errores (USD) |
 |---|---:|
 | Champion v1 | 1.032 |
 | Contactar a todos | 1.050 |
 | Regla de una sesión restante | 3.312 |
-| No realizar intervención | 6.840 |
+| No intervenir | 6.840 |
 
-Los costos corresponden a una función hipotética de penalización:
+La ventaja de USD 18 (1,71 %) frente a contactar a todos es marginal y no equivale a ahorro clínico observado.
 
-```text
-Costo = 120 × FN + 3 × FP
+| Evidencia en `docs/` | Contenido | Filas históricas |
+|---|---|---:|
+| `corridas.csv` | Historial consolidado MLflow | 103 |
+| `predicciones.csv` | Inferencias de producción | 407 |
+| `monitoreo.csv` | Desempeño supervisado y costos | 8 |
+| `alertas.csv` | Alertas operativas | 16 |
+| `reentrenamientos.csv` | Corridas y decisiones | 1 |
+| `lotes_produccion.csv` | Control y maduración | 8 |
+| `monitoreo_inmediato.csv` | Calidad y telemetría agregada | 8 |
+| `deriva_features.csv` | PSI y pruebas por variable | 104 |
+| `solicitudes_http.csv` | Telemetría HTTP individual | 395 |
+| `equidad.csv` | Desempeño por subgrupos | 10 |
+| `predicciones_demostracion.csv` | Rollback y respaldo | 7 |
+
+Los cinco primeros CSV constituyen las evidencias principales del PSet4; los restantes son complementarios.
+
+Comprobar los conteos sin volver a ejecutar el pipeline:
+
+```powershell
+Get-ChildItem .\docs\*.csv | ForEach-Object {
+    [PSCustomObject]@{ Archivo = $_.Name; Filas = @(Import-Csv $_.FullName).Count }
+} | Format-Table -AutoSize
 ```
 
-El champion presenta un costo estimado inferior a las estrategias comparadas. Sin embargo, su ventaja frente a contactar a todos es de únicamente USD 18, evitando seis contactos.
+Para detener la infraestructura conservando los volúmenes:
 
-La mejora económica frente a esta última estrategia es marginal y no demuestra una superioridad robusta.
-
-Los resultados incluyen dos lotes con deriva inducida y proceden de datos sintéticos. No representan ahorros económicos reales ni demuestran causalmente que los contactos preventivos reduzcan el abandono.
-
-La meta de negocio de incrementar en diez puntos porcentuales la continuidad de los tratamientos requiere una evaluación prospectiva con intervenciones reales y supervisión clínica.
-
-### 14. Evidencias y trazabilidad
-
-Los resultados de los PSet 3 y 4 se conservan en el directorio `docs/`.
-
-| Archivo | Contenido |
-|---|---|
-| `resultados_modelos.csv` | Comparación inicial de modelos |
-| `resultados_tuning.csv` | Optimización de hiperparámetros |
-| `resultados_seleccion.csv` | Selección final del modelo |
-| `corridas.csv` | Historial de corridas de MLflow |
-| `predicciones.csv` | Predicciones de producción simulada |
-| `predicciones_demostracion.csv` | Predicciones de demostraciones de la API |
-| `lotes_produccion.csv` | Control y maduración de los lotes |
-| `solicitudes_http.csv` | Telemetría HTTP |
-| `monitoreo.csv` | Métricas supervisadas y económicas |
-| `monitoreo_inmediato.csv` | Métricas inmediatas |
-| `deriva_features.csv` | Deriva y calidad por variable |
-| `alertas.csv` | Alertas registradas |
-| `equidad.csv` | Evaluación por subgrupos |
-| `reentrenamientos.csv` | Corridas y decisiones de reentrenamiento |
-| `cambios.md` | Correcciones y decisiones metodológicas |
-
-La trazabilidad del sistema permite relacionar:
-
-```text
-Predicción individual
-    → Sesión y plan de tratamiento
-    → Lote de producción
-    → Versión del modelo
-    → Run ID de MLflow
-    → Snapshot utilizado
-    → OBT y tabla de hechos Gold
-    → Fuentes originales del pipeline ELT
+```powershell
+docker compose -p proyecto_final down
 ```
 
-La documentación histórica de los PSet anteriores se conserva en `docs/historial/`.
+No utilizar `down -v` para detener el proyecto normalmente, pues elimina volúmenes persistentes. Para reanudar, iniciar los servicios de los apartados anteriores y comprobar los alias y tablas existentes.
+
+**Documentación:** [PSet1](docs/historial/PSet1_memo_Tiban.pdf), [PSet2](docs/historial/PSet2_memo_Tiban.pdf), [PSet3](docs/historial/PSet3_memo_Tiban.pdf), [memo integral PSet4](docs/PSet4_memo_Tiban.pdf), [presentación ejecutiva](docs/PSet4_presentacion_Tiban.pdf) y [registro de correcciones](docs/cambios.md).
+
+Las métricas anteriores corresponden al entorno histórico verificado. Una reproducción nueva puede generar identificadores, versiones, latencias, telemetría y alertas diferentes. No se ha certificado una instalación integral independiente desde cero. OralSolutions es un prototipo con datos sintéticos; su uso clínico requiere validación adicional y supervisión humana.
