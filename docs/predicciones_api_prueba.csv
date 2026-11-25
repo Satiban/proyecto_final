@@ -1,2 +1,0 @@
-id_prediccion,timestamp,entradas_json,probabilidad,decision,version_modelo,run_id,uso_respaldo,latencia_ms
-d332e3b4-efb6-4505-a4ee-93022680c523,2026-11-24T04:28:11.744094+00:00,"{""duracion_estimada_min"": 75, ""numero_sesion"": 1, ""sesiones_planificadas"": 3, ""cancelaciones_previas"": 0, ""inasistencias_previas"": 0, ""dias_desde_inicio_plan"": 14, ""edad_en_atencion"": 42, ""codigo_procedimiento"": ""CROWN"", ""odontologo_key"": ""2""}",0.09417587082633772,contactar,1,c90a1c37aef940278afc025b1d22dc6b,False,354.567
